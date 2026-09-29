@@ -1223,6 +1223,170 @@ int perturbations_free(
  * @return the error status
  */
 
+/**
+ * Resolve the list of neutrino masses for which the Cosmic Neutrino
+ * Background anisotropies will be computed, and convert them into the
+ * dimensionless masses \f$ M=m_\nu/T_{\nu,0} \f$ used everywhere else
+ * (same convention as pba->M_ncdm).
+ *
+ * If the user did not provide 'cnb_m_nu', the ncdm species declared in
+ * the background are used.
+ *
+ * @param pba Input: pointer to background structure
+ * @param ppt Input/Output: perturbation structure
+ * @return the error status
+ */
+
+/**
+ * Prepend to ppt->tau_sampling a set of logarithmically spaced points
+ * reaching deep inside the radiation era, so that the CNB Sachs-Wolfe
+ * term can read phi at its radiation-era plateau value.
+ *
+ * The earliest point is set by the thermodynamics table, which starts at
+ * ppr->thermo_z_initial; we stay a safe factor below it. There is no
+ * point in going further back than neutrino decoupling either, since
+ * that is where the CNB sources actually start.
+ *
+ * @param ppr Input: pointer to precision structure
+ * @param pba Input: pointer to background structure
+ * @param ppt Input/Output: perturbation structure (tau_sampling extended)
+ * @return the error status
+ */
+
+int perturbations_prepend_radiation_era_sampling(
+                                                 struct precision * ppr,
+                                                 struct background * pba,
+                                                 struct perturbations * ppt
+                                                 ) {
+
+  /** Summary: */
+
+  /** - define local variables */
+
+  int index_tau;
+  int tau_size_old;
+
+  /* redshift and conformal time at which the extended sampling starts */
+  double z_start,tau_start;
+
+  /* first point of the original sampling */
+  double tau_end;
+
+  /* extended array */
+  double * tau_sampling_new;
+
+  /** - target redshift: deep in the radiation era, but safely inside
+      the thermodynamics table, and never earlier than neutrino
+      decoupling */
+
+  z_start = MIN(ppt->cnb_z_dec,ppr->thermo_z_initial/5.);
+
+  /* if the sampling already starts early enough, there is nothing to do */
+  class_call(background_tau_of_z(pba,z_start,&tau_start),
+             pba->error_message,
+             ppt->error_message);
+
+  tau_end = ppt->tau_sampling[0];
+
+  if (tau_start >= tau_end)
+    return _SUCCESS_;
+
+  /** - build the extended array */
+
+  tau_size_old = ppt->tau_size;
+
+  class_alloc(tau_sampling_new,
+              (tau_size_old+ppr->cnb_radiation_era_tau_size) * sizeof(double),
+              ppt->error_message);
+
+  for (index_tau=0; index_tau < ppr->cnb_radiation_era_tau_size; index_tau++) {
+    tau_sampling_new[index_tau] =
+      tau_start*exp(((double)index_tau/(double)ppr->cnb_radiation_era_tau_size)
+                    *log(tau_end/tau_start));
+  }
+
+  for (index_tau=0; index_tau < tau_size_old; index_tau++) {
+    tau_sampling_new[ppr->cnb_radiation_era_tau_size+index_tau] = ppt->tau_sampling[index_tau];
+  }
+
+  free(ppt->tau_sampling);
+
+  ppt->tau_sampling = tau_sampling_new;
+  ppt->tau_size = tau_size_old+ppr->cnb_radiation_era_tau_size;
+
+  if (ppt->perturbations_verbose > 0)
+    printf(" -> CNB: extended the source sampling back to z=%g (tau=%g Mpc), %d extra time steps\n",
+           z_start,tau_start,ppr->cnb_radiation_era_tau_size);
+
+  return _SUCCESS_;
+
+}
+
+int perturbations_cnb_indices(
+                              struct background * pba,
+                              struct perturbations * ppt
+                              ) {
+
+  /* index running on CNB species */
+  int index_cnb;
+
+  /* temperature of the neutrino fluid used to make masses and momenta dimensionless */
+  double T_ncdm;
+
+  /** - if no mass was given explicitly, inherit the ncdm species */
+
+  if (ppt->cnb_num == 0) {
+
+    class_test(pba->N_ncdm < 1,
+               ppt->error_message,
+               "You asked for 'cnbCl' but your cosmology contains no ncdm species. Either declare massive neutrinos through 'N_ncdm'/'m_ncdm', or give the CNB masses explicitly through 'cnb_m_nu'.");
+
+    class_test(pba->N_ncdm > _CNB_NUM_MAX_,
+               ppt->error_message,
+               "You have %d ncdm species but at most %d can be treated in one CNB run; select them explicitly with 'cnb_m_nu'",
+               pba->N_ncdm,_CNB_NUM_MAX_);
+
+    ppt->cnb_num = pba->N_ncdm;
+
+    for (index_cnb=0; index_cnb < ppt->cnb_num; index_cnb++) {
+      ppt->cnb_m_in_eV[index_cnb] = pba->m_ncdm_in_eV[index_cnb];
+      ppt->cnb_M[index_cnb] = pba->M_ncdm[index_cnb];
+    }
+  }
+
+  /** - otherwise convert the masses given in eV, using the temperature
+      of the first ncdm species (or the default neutrino temperature if
+      the cosmology has none) */
+
+  else {
+
+    if (pba->N_ncdm > 0)
+      T_ncdm = pba->T_ncdm[0];
+    else
+      T_ncdm = pba->T_ncdm_default;
+
+    for (index_cnb=0; index_cnb < ppt->cnb_num; index_cnb++) {
+      ppt->cnb_M[index_cnb] = ppt->cnb_m_in_eV[index_cnb]/_k_B_*_eV_/T_ncdm/pba->T_cmb;
+    }
+  }
+
+  /** - the derivation of eq. (3.2.24) and (3.2.32) assumes adiabatic
+      initial conditions: the Sachs-Wolfe term is anchored to the
+      super-horizon value of phi during radiation domination, which is
+      constant only for the adiabatic mode */
+
+  class_test((ppt->has_bi == _TRUE_) || (ppt->has_cdi == _TRUE_) ||
+             (ppt->has_nid == _TRUE_) || (ppt->has_niv == _TRUE_),
+             ppt->error_message,
+             "The CNB anisotropies are implemented for adiabatic initial conditions only, but you requested isocurvature modes. Set 'ic=ad'.");
+
+  /* note: phi and psi are stored by CLASS as the Bardeen potentials in
+     both gauges, so no gauge restriction is needed here */
+
+  return _SUCCESS_;
+
+}
+
 int perturbations_indices(
                           struct precision * ppr,
                           struct background * pba,
@@ -1348,6 +1512,20 @@ int perturbations_indices(
   if (ppt->has_cl_cmb_polarization == _TRUE_) {
     ppt->has_source_p = _TRUE_;
     ppt->has_cmb = _TRUE_;
+  }
+
+  /* The CNB anisotropies are sourced by the metric perturbations all
+     the way from neutrino decoupling to today, and their integrated
+     Sachs-Wolfe term must be resolved with the same time sampling as
+     the CMB one. We therefore reuse the "has_cmb" sampling strategy
+     (early start, rate set by the metric variation), even though no
+     photon source function is computed here. */
+  if (ppt->has_cl_cnb == _TRUE_) {
+    ppt->has_cmb = _TRUE_;
+
+    class_call(perturbations_cnb_indices(pba,ppt),
+               ppt->error_message,
+               ppt->error_message);
   }
 
   index_type = 0;
@@ -1476,6 +1654,17 @@ int perturbations_indices(
           ppt->has_source_phi_prime = _TRUE_;
           ppt->has_source_phi_plus_psi = _TRUE_;
         }
+      }
+
+      /* The CNB anisotropies of eq. (3.2.24) [momentum approach] and
+         (3.2.32) [energy approach] are built out of the Bardeen
+         potentials phi and psi and of their conformal-time
+         derivatives. phi' is available exactly; psi' is obtained by
+         splining psi in tau inside the transfer module. */
+      if (ppt->has_cl_cnb == _TRUE_) {
+        ppt->has_source_phi = _TRUE_;
+        ppt->has_source_phi_prime = _TRUE_;
+        ppt->has_source_psi = _TRUE_;
       }
 
       if (ppt->has_metricpotential_transfers == _TRUE_ ) {
@@ -2048,6 +2237,31 @@ int perturbations_timesampling_for_sources(
 
   free(pvecback);
   free(pvecthermo);
+
+  /** - if the Cosmic Neutrino Background is requested, prepend a few
+      sampling points deep inside the radiation era.
+
+      The Sachs-Wolfe term of eq. (3.2.24) and (3.2.32) needs phi at
+      neutrino decoupling. The sampling built above starts when the
+      universe stops being opaque, i.e. around z ~ 1400, which is
+      already matter dominated: the super-horizon phi has by then
+      dropped by the familiar factor ~9/10 below its radiation-era
+      value, so reading it there would misnormalise the CNB Sachs-Wolfe
+      term by ~8%. We therefore extend the sampling backwards, as far as
+      the thermodynamics table allows, to a redshift deep enough in the
+      radiation era that phi has reached its plateau.
+
+      These extra points are cheap: they are logarithmically spaced, the
+      large-k modes are already integrated from those times anyway (they
+      have to start while they are still super-horizon), and the sources
+      are smooth there. */
+
+  if (ppt->has_cl_cnb == _TRUE_) {
+
+    class_call(perturbations_prepend_radiation_era_sampling(ppr,pba,ppt),
+               ppt->error_message,
+               ppt->error_message);
+  }
 
   /** - check the maximum redshift z_max_pk at which the Fourier
       transfer functions \f$ T_i(k,z)\f$ should be computable by

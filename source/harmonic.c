@@ -386,6 +386,7 @@ int harmonic_indices(
   int index_ct;
   int index_md;
   int index_ic1_ic2;
+  int index_n;
 
   phr->md_size = ppt->md_size;
   if (ppt->has_scalars == _TRUE_)
@@ -563,6 +564,36 @@ int harmonic_indices(
       phr->has_dl = _FALSE_;
     }
 
+    /* Cosmic Neutrino Background: one auto-spectrum per neutrino mass,
+       and its cross-correlation with the CMB temperature */
+
+    if ((ppt->has_cl_cnb == _TRUE_) && (ppt->has_scalars == _TRUE_)) {
+      phr->n_size = ppt->cnb_num;
+      for (index_n=0; index_n < phr->n_size; index_n++)
+        phr->cnb_m_in_eV[index_n] = ppt->cnb_m_in_eV[index_n];
+    }
+    else {
+      phr->n_size = 0;
+    }
+
+    if ((ppt->has_cl_cnb == _TRUE_) && (ppt->has_scalars == _TRUE_)) {
+      phr->has_nn = _TRUE_;
+      phr->index_ct_nn=index_ct;
+      index_ct += phr->n_size;
+    }
+    else {
+      phr->has_nn = _FALSE_;
+    }
+
+    if ((ppt->has_cl_cnb == _TRUE_) && (ppt->has_cl_cmb_temperature == _TRUE_) && (ppt->has_scalars == _TRUE_)) {
+      phr->has_tn = _TRUE_;
+      phr->index_ct_tn=index_ct;
+      index_ct += phr->n_size;
+    }
+    else {
+      phr->has_tn = _FALSE_;
+    }
+
     phr->ct_size = index_ct;
 
     /* infer from input quantities the l_max for each mode and type,
@@ -623,6 +654,21 @@ int harmonic_indices(
              index_ct < phr->index_ct_dl+(phr->d_size*phr->d_size - (phr->d_size-phr->non_diag)*(phr->d_size-1-phr->non_diag));
              index_ct++)
           phr->l_max_ct[ppt->index_md_scalars][index_ct] = ppt->l_lss_max;
+
+      /* CNB spectra computed up to l_scalar_max, like the CMB ones they
+         are cross-correlated with */
+
+      if (phr->has_nn == _TRUE_)
+        for (index_ct=phr->index_ct_nn;
+             index_ct < phr->index_ct_nn+phr->n_size;
+             index_ct++)
+          phr->l_max_ct[ppt->index_md_scalars][index_ct] = ppt->l_scalar_max;
+
+      if (phr->has_tn == _TRUE_)
+        for (index_ct=phr->index_ct_tn;
+             index_ct < phr->index_ct_tn+phr->n_size;
+             index_ct++)
+          phr->l_max_ct[ppt->index_md_scalars][index_ct] = ppt->l_scalar_max;
 
     }
 
@@ -892,6 +938,9 @@ int harmonic_compute_cl(
   double transfer_ic2_temp=0.;
   double * transfer_ic1_nc=NULL;
   double * transfer_ic2_nc=NULL;
+  double * transfer_ic1_cnb=NULL;
+  double * transfer_ic2_cnb=NULL;
+  int index_n1;
   double factor;
   int index_q_spline=0;
   double * integrand;
@@ -912,6 +961,11 @@ int harmonic_compute_cl(
   if (ppt->has_cl_number_count == _TRUE_ && _scalars_) {
     class_alloc(transfer_ic1_nc,phr->d_size*sizeof(double),phr->error_message);
     class_alloc(transfer_ic2_nc,phr->d_size*sizeof(double),phr->error_message);
+  }
+
+  if (ppt->has_cl_cnb == _TRUE_ && _scalars_) {
+    class_alloc(transfer_ic1_cnb,phr->n_size*sizeof(double),phr->error_message);
+    class_alloc(transfer_ic2_cnb,phr->n_size*sizeof(double),phr->error_message);
   }
 
   /* Technical point: here, we will do a spline integral over the
@@ -1035,6 +1089,29 @@ int harmonic_compute_cl(
             + transfer_ic2[ptr->index_tt_nc_g5+index_d1];
         }
 
+      }
+    }
+
+    /* the total CNB anisotropy of eq. (3.2.24) and (3.2.32) is the sum
+       of its Sachs-Wolfe and integrated Sachs-Wolfe terms, which the
+       transfer module stores separately */
+
+    if (ppt->has_cl_cnb == _TRUE_ && _scalars_) {
+
+      for (index_n1=0; index_n1<phr->n_size; index_n1++) {
+
+        transfer_ic1_cnb[index_n1] = 0.;
+        transfer_ic2_cnb[index_n1] = 0.;
+
+        if (ppt->has_cnb_sw == _TRUE_) {
+          transfer_ic1_cnb[index_n1] += transfer_ic1[ptr->index_tt_cnb_sw+index_n1];
+          transfer_ic2_cnb[index_n1] += transfer_ic2[ptr->index_tt_cnb_sw+index_n1];
+        }
+
+        if (ppt->has_cnb_isw == _TRUE_) {
+          transfer_ic1_cnb[index_n1] += transfer_ic1[ptr->index_tt_cnb_isw+index_n1];
+          transfer_ic2_cnb[index_n1] += transfer_ic2[ptr->index_tt_cnb_isw+index_n1];
+        }
       }
     }
 
@@ -1163,6 +1240,28 @@ int harmonic_compute_cl(
       }
     }
 
+    /* Cosmic Neutrino Background spectra, eq. (3.2.37) */
+
+    if (_scalars_ && (phr->has_nn == _TRUE_)) {
+      for (index_n1=0; index_n1<phr->n_size; index_n1++) {
+        cl_integrand[index_q*cl_integrand_num_columns+1+phr->index_ct_nn+index_n1]=
+          primordial_pk[index_ic1_ic2]
+          * transfer_ic1_cnb[index_n1]
+          * transfer_ic2_cnb[index_n1]
+          * factor;
+      }
+    }
+
+    if (_scalars_ && (phr->has_tn == _TRUE_)) {
+      for (index_n1=0; index_n1<phr->n_size; index_n1++) {
+        cl_integrand[index_q*cl_integrand_num_columns+1+phr->index_ct_tn+index_n1]=
+          primordial_pk[index_ic1_ic2]
+          * 0.5*(transfer_ic1_temp * transfer_ic2_cnb[index_n1] +
+                 transfer_ic1_cnb[index_n1] * transfer_ic2_temp)
+          * factor;
+      }
+    }
+
     if (_scalars_ && (phr->has_pd == _TRUE_)) {
       for (index_d1=0; index_d1<phr->d_size; index_d1++) {
         cl_integrand[index_q*cl_integrand_num_columns+1+phr->index_ct_pd+index_d1]=
@@ -1287,7 +1386,12 @@ int harmonic_compute_cl(
         (_vectors_ && (phr->has_pd == _TRUE_) && (index_ct == phr->index_ct_pd)) ||
         (_vectors_ && (phr->has_ll == _TRUE_) && (index_ct == phr->index_ct_ll)) ||
         (_vectors_ && (phr->has_tl == _TRUE_) && (index_ct == phr->index_ct_tl)) ||
-        (_vectors_ && (phr->has_dl == _TRUE_) && (index_ct == phr->index_ct_dl))
+        (_vectors_ && (phr->has_dl == _TRUE_) && (index_ct == phr->index_ct_dl)) ||
+        /* the CNB is only computed for scalars */
+        (!(_scalars_) && (phr->has_nn == _TRUE_) &&
+         (index_ct >= phr->index_ct_nn) && (index_ct < phr->index_ct_nn+phr->n_size)) ||
+        (!(_scalars_) && (phr->has_tn == _TRUE_) &&
+         (index_ct >= phr->index_ct_tn) && (index_ct < phr->index_ct_tn+phr->n_size))
 	) {
 
       phr->cl[index_md]
@@ -1371,6 +1475,11 @@ int harmonic_compute_cl(
   if (ppt->has_cl_number_count == _TRUE_ && _scalars_) {
     free(transfer_ic1_nc);
     free(transfer_ic2_nc);
+  }
+
+  if (ppt->has_cl_cnb == _TRUE_ && _scalars_) {
+    free(transfer_ic1_cnb);
+    free(transfer_ic2_cnb);
   }
 
   return _SUCCESS_;

@@ -146,7 +146,52 @@ struct transfer {
   int index_tt_vector_t1;    /**< index for transfer type = temperature (j=1, m=1 term) for vector mode */
   int index_tt_vector_b;     /**< index for transfer type = B-polarization for vector modes (m=1) */
 
+  int index_tt_cnb_sw;  /**< index for first CNB species of transfer type = Cosmic Neutrino Background, Sachs-Wolfe term (ppt->cnb_num values) */
+  int index_tt_cnb_isw; /**< index for first CNB species of transfer type = Cosmic Neutrino Background, integrated Sachs-Wolfe term (ppt->cnb_num values) */
+
   int * tt_size;     /**< number of requested transfer types tt_size[index_md] for each mode */
+
+  //@}
+
+  /** @name - tables describing the free-streaming of the Cosmic
+      Neutrino Background between decoupling and today.
+
+      Because massive neutrinos travel at a momentum-dependent speed
+      \f$ v=q/\epsilon \f$, the radial coordinate entering the Bessel
+      functions of eq. (3.2.24) and (3.2.32) is not \f$ \tau_0-\tau \f$
+      but the neutrino comoving distance
+      \f$ \chi_\nu(\tau)=\int_\tau^{\tau_0} (q/\epsilon) d\tau' \f$,
+      which depends on both the neutrino mass and its momentum. All the
+      quantities below are therefore tabulated for each pair
+      (CNB species, neutrino momentum), flattened as
+      index_cnb*ptr->cnb_q_size+index_q_nu, and are independent of the
+      wavenumber k. */
+
+  //@{
+
+  short has_cnb;      /**< do we compute CNB transfer functions in this run? */
+
+  int cnb_num;        /**< number of CNB species (copy of ppt->cnb_num) */
+  int cnb_q_size;     /**< number of sampled neutrino momenta (copy of ppt->cnb_q_size) */
+  int cnb_size;       /**< cnb_num*cnb_q_size, i.e. size of the tables below */
+  int cnb_tau_size;   /**< number of time values in the tables below (copy of ppt->tau_size) */
+
+  double * cnb_q;     /**< cnb_q[index_q_nu]: sampled comoving momenta, in units of \f$ T_{\nu,0} \f$ */
+  double * cnb_weight;/**< cnb_weight[index_cnb*cnb_q_size+index_q_nu]: normalised weights \f$ q^2\epsilon f_0(q) \f$ of the momentum average, eq. (3.2.38) */
+
+  double * cnb_chi;   /**< cnb_chi[(index_cnb*cnb_q_size+index_q_nu)*cnb_tau_size+index_tau]: neutrino comoving distance \f$ \chi_\nu(\tau) \f$, sampled on ppt->tau_sampling */
+  double * cnb_eps;   /**< same layout: comoving energy \f$ \epsilon=\sqrt{q^2+a^2M^2} \f$ */
+  double * cnb_deps;  /**< same layout: conformal time derivative \f$ d\epsilon/d\tau = a^2M^2\mathcal{H}/\epsilon \f$ */
+  double * cnb_Gamma; /**< same layout: \f$ \Gamma=d\ln f_0/d\ln\epsilon \f$ of the energy approach (unused in the momentum approach) */
+  double * cnb_dGamma;/**< same layout: conformal time derivative of the above */
+
+  double * cnb_chi_dec;   /**< cnb_chi_dec[index_cnb*cnb_q_size+index_q_nu]: comoving distance to the neutrino last scattering surface, \f$ \chi_\nu(\tau_{dec}) \f$ */
+  double * cnb_eps_dec;   /**< same layout: comoving energy at neutrino decoupling */
+  double * cnb_Gamma_dec; /**< same layout: \f$ \Gamma \f$ at neutrino decoupling */
+  double * cnb_Gamma_0;   /**< same layout: \f$ \Gamma \f$ today */
+
+  double cnb_tau_dec;  /**< conformal time of neutrino decoupling */
+  double cnb_phi_dec;  /**< super-horizon value of phi during radiation domination, per unit primordial curvature perturbation; this is phi(tau_dec,k) for every k of interest, since all of them are far outside the horizon at neutrino decoupling */
 
   //@}
 
@@ -259,6 +304,23 @@ struct transfer_workspace {
                                     case) */
   double * cscKgen;              /**< cscKgen[index_tau]: useful trigonometric function */
   double * cotKgen;              /**< cotKgen[index_tau]: useful trigonometric function */
+
+  //@}
+
+  /** @name - metric perturbations needed by the CNB source functions,
+      interpolated at the wavenumber currently being processed. Unlike
+      the other transfer types, the CNB sources of eq. (3.2.24) and
+      (3.2.32) combine several perturbation source types at once, so
+      they cannot be built from the single 'interpolated_sources'
+      array. All arrays have ptr->cnb_tau_size entries. */
+
+  //@{
+
+  double * cnb_phi;       /**< cnb_phi[index_tau]: Bardeen potential phi */
+  double * cnb_phi_prime; /**< cnb_phi_prime[index_tau]: its conformal time derivative, taken directly from the perturbation module */
+  double * cnb_psi;       /**< cnb_psi[index_tau]: Bardeen potential psi */
+  double * cnb_psi_prime; /**< cnb_psi_prime[index_tau]: its conformal time derivative, obtained by splining psi in tau */
+  double * cnb_ddpsi;     /**< cnb_ddpsi[index_tau]: second derivatives used for the above spline */
 
   //@}
 
@@ -562,7 +624,8 @@ extern "C" {
                                   double l,
                                   double q_max_bessel,
                                   radial_function_type radial_type,
-                                  short use_full_limber
+                                  short use_full_limber,
+                                  double * transfer_function_out
                                   );
 
   int transfer_use_limber(
@@ -736,6 +799,52 @@ extern "C" {
                      double cotKgen,
                      double* f_evo
                      );
+
+  int transfer_cnb_precompute(
+                              struct precision * ppr,
+                              struct background * pba,
+                              struct perturbations * ppt,
+                              struct transfer * ptr,
+                              double *** pert_sources
+                              );
+
+  int transfer_cnb_free(
+                        struct transfer * ptr
+                        );
+
+  int transfer_cnb_interpolate_potentials(
+                                          struct perturbations * ppt,
+                                          struct transfer * ptr,
+                                          struct transfer_workspace * ptw,
+                                          double k,
+                                          int index_md,
+                                          int index_ic,
+                                          double *** pert_sources,
+                                          double *** pert_sources_spline
+                                          );
+
+  int transfer_cnb_source(
+                          struct perturbations * ppt,
+                          struct transfer * ptr,
+                          struct transfer_workspace * ptw,
+                          int index_cnb,
+                          int index_q_nu,
+                          short is_sw,
+                          double * sources,
+                          double * tau0_minus_tau,
+                          double * w_trapz,
+                          int * tau_size_out
+                          );
+
+  int transfer_cnb_compute_for_each_q(
+                                      struct precision * ppr,
+                                      struct perturbations * ppt,
+                                      struct transfer * ptr,
+                                      struct transfer_workspace * ptw,
+                                      int index_q,
+                                      int index_md,
+                                      int index_ic
+                                      );
 
 #ifdef __cplusplus
 }

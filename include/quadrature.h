@@ -2,6 +2,9 @@
 #define __QSS__
 
 #define _MIN_NUMBER_OF_LAGUERRE_POINTS_ 5
+/* beyond this many nodes, the exp(-q) factor carried by the Gauss-Laguerre
+   weights underflows to zero in double precision */
+#define _MAX_NUMBER_OF_LAGUERRE_POINTS_ 80
 
 /******************************************/
 /* Quadrature Sampling Strategy for CLASS */

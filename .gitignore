@@ -14,3 +14,6 @@ RealSpaceInterface/cache/
 .DS_Store
 doc/manual/html
 doc/manual/latex
+
+# locally built classy wrapper for the CNB branch (regenerable, see CNB_IN_CLASS.md)
+classy_cnb/

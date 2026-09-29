@@ -61,6 +61,8 @@ struct harmonic {
   int has_ll; /**< do we want \f$ C_l^{ll}\f$? (l = galaxy lensing potential) */
   int has_tl; /**< do we want \f$ C_l^{Tl}\f$? */
   int has_dl; /**< do we want \f$ C_l^{dl}\f$? */
+  int has_nn; /**< do we want \f$ C_l^{\nu\nu}\f$? (\f$ \nu \f$ = Cosmic Neutrino Background) */
+  int has_tn; /**< do we want \f$ C_l^{T\nu}\f$? */
 
   int index_ct_tt; /**< index for type \f$ C_l^{TT} \f$*/
   int index_ct_ee; /**< index for type \f$ C_l^{EE} \f$*/
@@ -75,8 +77,12 @@ struct harmonic {
   int index_ct_ll; /**< first index for type \f$ C_l^{ll} \f$((d_size*d_size-(d_size-non_diag)*(d_size-non_diag-1)/2) values) */
   int index_ct_tl; /**< first index for type \f$ C_l^{Tl} \f$(d_size values) */
   int index_ct_dl; /**< first index for type \f$ C_l^{dl} \f$(d_size values) */
+  int index_ct_nn; /**< first index for type \f$ C_l^{\nu\nu} \f$(n_size values, one per neutrino mass) */
+  int index_ct_tn; /**< first index for type \f$ C_l^{T\nu} \f$(n_size values, one per neutrino mass) */
 
   int d_size;      /**< number of bins for which density Cl's are computed */
+  int n_size;      /**< number of neutrino masses for which Cosmic Neutrino Background Cl's are computed */
+  double cnb_m_in_eV[_CNB_NUM_MAX_]; /**< those neutrino masses in eV, copied here so that the output module can label the columns */
 
   int ct_size; /**< number of \f$ C_l \f$ types requested */
 

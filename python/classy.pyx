@@ -852,6 +852,98 @@ cdef class Class:
 
         return cl
 
+    def cnb_cl(self, lmax=-1, nofail=False):
+        """
+        Cosmic Neutrino Background anisotropy spectra
+
+        Return the angular power spectrum of the Cosmic Neutrino Background
+        anisotropies, and its cross-correlation with the CMB temperature.
+        This function requires that the 'output' field contains 'cnbCl'
+        (and 'tCl' as well, for the cross-correlation to be available).
+
+        One spectrum is returned per neutrino mass, i.e. per entry of the
+        'cnb_m_nu' input list (or per ncdm species, if that list was not
+        given). The returned C_l's are all dimensionless.
+
+        Parameters
+        ----------
+        lmax : int, optional
+            Define the maximum l for which the C_l will be returned (inclusively).
+
+        nofail: bool, optional
+            Even if lmax is larger than expected from the user input, check and
+            enforce the computation of the C_l in the harmonic module up to lmax.
+
+        Returns
+        -------
+        cl : dict
+            Dictionary containing 'ell' (the multipoles), 'm_nu' (the neutrino
+            masses in eV, in the order in which the spectra are stacked), 'nn'
+            (the CNB auto-correlation, of shape (n_mass, lmax+1)) and, if the CMB
+            temperature was also requested, 'tn' (the CNB-CMB cross-correlation,
+            same shape).
+        """
+        self.compute(["harmonic"])
+        cdef int lmaxR
+        cdef int index_n
+
+        if not self.hr.has_nn:
+            raise CosmoSevereError(
+                "No Cosmic Neutrino Background Cl computed. Add 'cnbCl' to the 'output' field.")
+
+        n_size = self.hr.n_size
+
+        lmaxR = self.hr.l_max_tot
+        if lmax == -1:
+            lmax = lmaxR
+        if lmax > lmaxR:
+            if nofail:
+                self._pars_check("l_max_scalars",lmax)
+                self.compute(["lensing"])
+            else:
+                raise CosmoSevereError("Can only compute up to lmax=%d"%lmaxR)
+
+        cdef double *rcl = <double*> calloc(self.hr.ct_size,sizeof(double))
+
+        cdef double **cl_md = <double**> calloc(self.hr.md_size, sizeof(double*))
+        for index_md in range(self.hr.md_size):
+            cl_md[index_md] = <double*> calloc(self.hr.ct_size, sizeof(double))
+
+        cdef double **cl_md_ic = <double**> calloc(self.hr.md_size, sizeof(double*))
+        for index_md in range(self.hr.md_size):
+            cl_md_ic[index_md] = <double*> calloc(self.hr.ct_size*self.hr.ic_ic_size[index_md], sizeof(double))
+
+        cl = {}
+        cl['nn'] = np.zeros((n_size, lmax+1), dtype=np.double)
+        if self.hr.has_tn:
+            cl['tn'] = np.zeros((n_size, lmax+1), dtype=np.double)
+
+        success = True
+        for ell from 2<=ell<lmax+1:
+            if harmonic_cl_at_l(&self.hr, ell, rcl, cl_md, cl_md_ic) == _FAILURE_:
+                success = False
+                break
+            for index_n in range(n_size):
+                cl['nn'][index_n][ell] = rcl[self.hr.index_ct_nn+index_n]
+                if self.hr.has_tn:
+                    cl['tn'][index_n][ell] = rcl[self.hr.index_ct_tn+index_n]
+
+        cl['ell'] = np.arange(lmax+1)
+        cl['m_nu'] = np.array([self.hr.cnb_m_in_eV[index_n] for index_n in range(n_size)])
+
+        free(rcl)
+        for index_md in range(self.hr.md_size):
+            free(cl_md[index_md])
+            free(cl_md_ic[index_md])
+        free(cl_md)
+        free(cl_md_ic)
+
+        # This has to be delayed until AFTER freeing the memory
+        if not success:
+          raise CosmoSevereError(self.hr.error_message)
+
+        return cl
+
     def lensed_cl(self, lmax=-1,nofail=False):
         """
         Lensed CMB spectra

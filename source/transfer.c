@@ -29,6 +29,7 @@
 
 #include "transfer.h"
 #include "parallel.h"
+#include "quadrature.h"
 
 /**
  * Transfer function \f$ \Delta_l^{X} (q) \f$ at a given wavenumber q.
@@ -188,6 +189,26 @@ int transfer_init(
     ptr->do_lcmb_full_limber = _FALSE_;
   }
 
+  /** - check whether we will need Cosmic Neutrino Background transfer
+      functions, and copy the parameters controlling them. This must
+      happen before transfer_indices(), which allocates one transfer
+      type per CNB species. */
+
+  if ((ppt->has_cl_cnb == _TRUE_) && (ppt->has_scalars == _TRUE_)) {
+    ptr->has_cnb = _TRUE_;
+    ptr->cnb_num = ppt->cnb_num;
+    ptr->cnb_q_size = ppt->cnb_q_size;
+    ptr->cnb_size = ptr->cnb_num*ptr->cnb_q_size;
+    ptr->cnb_tau_size = ppt->tau_size;
+  }
+  else {
+    ptr->has_cnb = _FALSE_;
+    ptr->cnb_num = 0;
+    ptr->cnb_q_size = 0;
+    ptr->cnb_size = 0;
+    ptr->cnb_tau_size = 0;
+  }
+
   /** - get number of modes (scalars, tensors...) */
 
   ptr->md_size = ppt->md_size;
@@ -279,6 +300,17 @@ int transfer_init(
   class_call(transfer_global_selection_read(ptr),
              ptr->error_message,
              ptr->error_message);
+
+  /** - precompute the neutrino free-streaming tables (comoving
+      distance, energy and phase-space logarithmic derivative for each
+      neutrino mass and momentum). These do not depend on k, so they
+      are computed once here rather than inside the parallel loop. */
+
+  if (ptr->has_cnb == _TRUE_) {
+    class_call(transfer_cnb_precompute(ppr,pba,ppt,ptr,sources),
+               ptr->error_message,
+               ptr->error_message);
+  }
 
   /** - precompute window function for integrated nCl/sCl quantities*/
   double* window = NULL;
@@ -458,6 +490,12 @@ int transfer_free(
       free(ptr->nz_evo_dlog_nz);
       free(ptr->nz_evo_dd_dlog_nz);
     }
+
+    if (ptr->has_cnb == _TRUE_) {
+      class_call(transfer_cnb_free(ptr),
+                 ptr->error_message,
+                 ptr->error_message);
+    }
   }
 
   ptr->is_allocated = _FALSE_;
@@ -531,6 +569,8 @@ int transfer_indices(
     class_define_index(ptr->index_tt_nc_g4,  ppt->has_nc_gr,                   index_tt,ppt->selection_num);
     class_define_index(ptr->index_tt_nc_g5,  ppt->has_nc_gr,                   index_tt,ppt->selection_num);
     class_define_index(ptr->index_tt_lensing,ppt->has_cl_lensing_potential,    index_tt,ppt->selection_num);
+    class_define_index(ptr->index_tt_cnb_sw, ptr->has_cnb && ppt->has_cnb_sw,  index_tt,ptr->cnb_num);
+    class_define_index(ptr->index_tt_cnb_isw,ptr->has_cnb && ppt->has_cnb_isw, index_tt,ptr->cnb_num);
 
     ptr->tt_size[ppt->index_md_scalars]=index_tt;
 
@@ -867,6 +907,12 @@ int transfer_get_l_list(
       if ((ppt->has_cl_lensing_potential == _TRUE_) ||
           (ppt->has_cl_number_count == _TRUE_))
         l_max=MAX(ppt->l_lss_max,l_max);
+
+      /* the CNB spectrum is a full-sky observable which we want to
+         cross-correlate with the CMB temperature, so it shares
+         l_scalar_max */
+      if (ptr->has_cnb == _TRUE_)
+        l_max=MAX(ppt->l_scalar_max,l_max);
     }
 
     if (ppt->has_vectors == _TRUE_)
@@ -989,6 +1035,10 @@ int transfer_get_l_list(
 
         if ((ppt->has_cl_lensing_potential == _TRUE_) && (index_tt >= ptr->index_tt_lensing) && (index_tt < ptr->index_tt_lensing+ppt->selection_num))
           l_max=ppt->l_lss_max;
+
+        if ((_index_tt_in_range_(ptr->index_tt_cnb_sw,  ptr->cnb_num, ptr->has_cnb && ppt->has_cnb_sw)) ||
+            (_index_tt_in_range_(ptr->index_tt_cnb_isw, ptr->cnb_num, ptr->has_cnb && ppt->has_cnb_isw)))
+          l_max=ppt->l_scalar_max;
 
       }
 
@@ -1568,6 +1618,15 @@ int transfer_get_source_correspondence(
         if ((ppt->has_cl_lensing_potential == _TRUE_) && (index_tt >= ptr->index_tt_lensing) && (index_tt < ptr->index_tt_lensing+ppt->selection_num))
           tp_of_tt[index_md][index_tt]=ppt->index_tp_phi_plus_psi;
 
+        /* The CNB sources combine phi, phi' and psi, so they are not
+           built from a single perturbation source type; they are
+           assembled in transfer_cnb_source() from the potentials that
+           transfer_cnb_interpolate_potentials() places in the
+           workspace. The entry below is only a placeholder, never used. */
+        if ((_index_tt_in_range_(ptr->index_tt_cnb_sw,  ptr->cnb_num, ptr->has_cnb && ppt->has_cnb_sw)) ||
+            (_index_tt_in_range_(ptr->index_tt_cnb_isw, ptr->cnb_num, ptr->has_cnb && ppt->has_cnb_isw)))
+          tp_of_tt[index_md][index_tt]=ppt->index_tp_phi;
+
       }
 
       if (_vectors_) {
@@ -1713,6 +1772,15 @@ int transfer_source_tau_size(
     /* scalar polarization */
     if ((ppt->has_cl_cmb_polarization == _TRUE_) && (index_tt == ptr->index_tt_e))
       *tau_size = ppt->tau_size;
+
+    /* Cosmic Neutrino Background: the integrated Sachs-Wolfe term uses
+       the full time sampling, the Sachs-Wolfe term is a Dirac at
+       neutrino decoupling and uses a single time */
+    if (_index_tt_in_range_(ptr->index_tt_cnb_isw, ptr->cnb_num, ptr->has_cnb && ppt->has_cnb_isw))
+      *tau_size = ppt->tau_size;
+
+    if (_index_tt_in_range_(ptr->index_tt_cnb_sw,  ptr->cnb_num, ptr->has_cnb && ppt->has_cnb_sw))
+      *tau_size = 1;
 
     /* cmb lensing potential */
     if ((ppt->has_cl_cmb_lensing_potential == _TRUE_) && (index_tt == ptr->index_tt_lcmb)) {
@@ -1959,10 +2027,58 @@ int transfer_compute_for_each_q(
         /* initialize the previous type index */
         previous_type=-1;
 
+        /** - the CNB transfer functions do not fit the "one
+              perturbation source per transfer type" pattern of the
+              loop below: they combine phi, phi' and psi, and they must
+              be convolved with Bessel functions of the neutrino
+              comoving distance, which depends on the neutrino
+              momentum. They are therefore computed by a dedicated
+              routine, which interpolates the potentials at this k and
+              performs the momentum average of eq. (3.2.38) on the fly. */
+
+        if ((ptr->has_cnb == _TRUE_) && (_scalars_) && (use_full_limber == _FALSE_)) {
+
+          class_call(transfer_cnb_interpolate_potentials(ppt,
+                                                         ptr,
+                                                         ptw,
+                                                         k,
+                                                         index_md,
+                                                         index_ic,
+                                                         pert_sources,
+                                                         pert_sources_spline),
+                     ptr->error_message,
+                     ptr->error_message);
+
+          class_call(transfer_cnb_compute_for_each_q(ppr,
+                                                     ppt,
+                                                     ptr,
+                                                     ptw,
+                                                     index_q,
+                                                     index_md,
+                                                     index_ic),
+                     ptr->error_message,
+                     ptr->error_message);
+        }
+
         /* - loop over types. For each of them: */
 
         for (index_tt = 0; index_tt < ptr->tt_size[index_md]; index_tt++) {
 
+          /* the CNB types have just been dealt with above */
+          if ((_index_tt_in_range_(ptr->index_tt_cnb_sw,  ptr->cnb_num, ptr->has_cnb && ppt->has_cnb_sw)) ||
+              (_index_tt_in_range_(ptr->index_tt_cnb_isw, ptr->cnb_num, ptr->has_cnb && ppt->has_cnb_isw))) {
+
+            /* in the full Limber pass, the CNB types are not computed
+               at all, so make sure they are not left uninitialised */
+            if (use_full_limber == _TRUE_) {
+              for (index_l = 0; index_l < ptr->l_size[index_md]; index_l++) {
+                ptr->transfer_limber[index_md][((index_ic * ptr->tt_size[index_md] + index_tt)
+                                                * ptr->l_size[index_md] + index_l)
+                                               * ptr->q_size_limber + index_q] = 0.;
+              }
+            }
+            continue;
+          }
 
           /** - define here wich transfer fucntion should be computed
                 in the standard way and full limber way. Currently:
@@ -2126,7 +2242,8 @@ int transfer_compute_for_each_q(
                                                        l,
                                                        q_max_bessel,
                                                        radial_type,
-                                                       use_full_limber
+                                                       use_full_limber,
+                                                       NULL
                                                        ),
                            ptr->error_message,
                            ptr->error_message);
@@ -3235,6 +3352,7 @@ int transfer_selection_compute(
  * @param q_max_bessel          Input: maximum value of argument q at which Bessel functions are computed
  * @param radial_type           Input: type of radial (Bessel) functions to convolve with
  * @param use_full_limber       Inpt: whether we will try using the full Limber scheme
+ * @param transfer_function_out Output: if non-NULL, the transfer function is returned here instead of being stored in ptr->transfer (used by the CNB, which accumulates over neutrino momenta before storing)
  * @return the error status
  */
 
@@ -3251,7 +3369,8 @@ int transfer_compute_for_each_l(
                                 double l,
                                 double q_max_bessel,
                                 radial_function_type radial_type,
-                                short use_full_limber
+                                short use_full_limber,
+                                double * transfer_function_out
                                 ){
 
   /** Summary: */
@@ -3332,8 +3451,12 @@ int transfer_compute_for_each_l(
     }
   }
 
-  /** - store transfer function in transfer structure */
-  if (use_full_limber == _FALSE_) {
+  /** - return the transfer function to the caller, or store it in the
+      transfer structure */
+  if (transfer_function_out != NULL) {
+    *transfer_function_out = transfer_function;
+  }
+  else if (use_full_limber == _FALSE_) {
     ptr->transfer[index_md][((index_ic * ptr->tt_size[index_md] + index_tt)
                              * ptr->l_size[index_md] + index_l)
                             * ptr->q_size + index_q]
@@ -4547,6 +4670,14 @@ int transfer_workspace_init(
   class_alloc(ptw->cscKgen,tau_size_max*sizeof(double),ptr->error_message);
   class_alloc(ptw->cotKgen,tau_size_max*sizeof(double),ptr->error_message);
 
+  if (ptr->has_cnb == _TRUE_) {
+    class_alloc(ptw->cnb_phi,ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+    class_alloc(ptw->cnb_phi_prime,ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+    class_alloc(ptw->cnb_psi,ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+    class_alloc(ptw->cnb_psi_prime,ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+    class_alloc(ptw->cnb_ddpsi,ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+  }
+
   return _SUCCESS_;
 }
 
@@ -4568,6 +4699,14 @@ int transfer_workspace_free(
   free(ptw->chi);
   free(ptw->cscKgen);
   free(ptw->cotKgen);
+
+  if (ptr->has_cnb == _TRUE_) {
+    free(ptw->cnb_phi);
+    free(ptw->cnb_phi_prime);
+    free(ptw->cnb_psi);
+    free(ptw->cnb_psi_prime);
+    free(ptw->cnb_ddpsi);
+  }
 
   return _SUCCESS_;
 }
@@ -5370,6 +5509,867 @@ int transfer_f_evo(
 
   /* after obtaining f_evo, store it in output */
   *f_evo = temp_f_evo;
+
+  return _SUCCESS_;
+}
+
+/**
+ * Unperturbed neutrino phase-space distribution, written as a function
+ * of the comoving momentum q in units of \f$ T_{\nu,0} \f$.
+ *
+ * Any constant prefactor is irrelevant here, since the weights built
+ * out of this function are normalised in transfer_cnb_precompute().
+ *
+ * @param params_for_function Input: unused, kept for compatibility with the quadrature interface
+ * @param q                   Input: comoving momentum in units of the neutrino temperature today
+ * @param f0                  Output: value of the distribution
+ * @return the error status
+ */
+
+int transfer_cnb_distribution(
+                              void * params_for_function,
+                              double q,
+                              double * f0
+                              ) {
+
+  *f0 = 1./(exp(q)+1.);
+
+  return _SUCCESS_;
+}
+
+/**
+ * Logarithmic derivative of the neutrino phase-space distribution with
+ * respect to the comoving energy, \f$ \Gamma=d\ln f_0/d\ln\epsilon \f$,
+ * and its derivative with respect to \f$ \epsilon \f$.
+ *
+ * This is the \f$ \Gamma \f$ of the "energy approach", eq. (3.2.25).
+ * With \f$ f_0=1/(e^{\epsilon}+1) \f$ and
+ * \f$ s=1/(1+e^{-\epsilon}) \f$ one gets \f$ \Gamma=-\epsilon s \f$ and
+ * \f$ d\Gamma/d\epsilon = -s-\epsilon s(1-s) \f$. Writing it with the
+ * logistic function s avoids overflowing exp() at large epsilon.
+ *
+ * In the "momentum approach" the same expression evaluated at
+ * \f$ \epsilon=q \f$ gives \f$ \Gamma=d\ln f_0/d\ln q \f$, which is
+ * time independent and drops out of eq. (3.2.24).
+ *
+ * @param eps       Input: comoving energy in units of the neutrino temperature today
+ * @param Gamma     Output: value of Gamma (may be NULL)
+ * @param dGamma_de Output: derivative of Gamma with respect to eps (may be NULL)
+ * @return the error status
+ */
+
+int transfer_cnb_Gamma(
+                       double eps,
+                       double * Gamma,
+                       double * dGamma_de
+                       ) {
+
+  double s;
+
+  s = 1./(1.+exp(-eps));
+
+  if (Gamma != NULL)
+    *Gamma = -eps*s;
+
+  if (dGamma_de != NULL)
+    *dGamma_de = -s - eps*s*(1.-s);
+
+  return _SUCCESS_;
+}
+
+/**
+ * Precompute everything that the CNB transfer functions need and that
+ * does not depend on the wavenumber: the neutrino momentum grid and its
+ * weights, and, for each (neutrino mass, momentum) pair, the tables of
+ * comoving energy \f$ \epsilon(\tau) \f$, comoving distance
+ * \f$ \chi_\nu(\tau) \f$ and phase-space logarithmic derivative
+ * \f$ \Gamma(\tau) \f$ sampled on ppt->tau_sampling.
+ *
+ * It also stores the value of phi at neutrino decoupling. Neutrino
+ * decoupling happens at z ~ 6e9, i.e. at a conformal time of order
+ * 1e-4 Mpc, so every wavenumber relevant for the CNB is far outside the
+ * horizon then (k*tau << 1) and phi still sits at its constant
+ * super-horizon radiation-dominated value. That value, per unit
+ * primordial curvature perturbation, is therefore read off the
+ * perturbation sources at the earliest sampled time and the smallest
+ * sampled wavenumber, where the super-horizon condition is best
+ * satisfied.
+ *
+ * @param ppr          Input: pointer to precision structure
+ * @param pba          Input: pointer to background structure
+ * @param ppt          Input: pointer to perturbation structure
+ * @param ptr          Input/Output: pointer to transfer structure
+ * @param pert_sources Input: array of perturbation sources
+ * @return the error status
+ */
+
+int transfer_cnb_precompute(
+                            struct precision * ppr,
+                            struct background * pba,
+                            struct perturbations * ppt,
+                            struct transfer * ptr,
+                            double *** pert_sources
+                            ) {
+
+  /** Summary: */
+
+  /** - define local variables */
+
+  /* indices running on CNB species, neutrino momenta, time */
+  int index_cnb,index_q_nu,index_tau,index_cnb_q;
+
+  /* index of the scalar mode and of the adiabatic initial condition */
+  int index_md,index_ic;
+
+  /* neutrino momentum and dimensionless mass */
+  double q,M;
+
+  /* scale factor, conformal Hubble rate, comoving energy, velocity */
+  double a,aH,eps,v,v_previous;
+
+  /* quadrature weights of the momentum average before normalisation */
+  double weight_sum;
+
+  /* background quantities */
+  double * pvecback;
+  int last_index;
+
+  /* quantities used to extend chi_nu below the first sampled time */
+  int index_extra;
+  double tau,tau_previous,dtau;
+
+  /* number of steps used to integrate chi_nu between neutrino
+     decoupling and the first sampled time */
+  int extra_size = 1024;
+
+  ptr->cnb_tau_size = ppt->tau_size;
+
+  /** - allocate the tables */
+
+  class_alloc(ptr->cnb_q,ptr->cnb_q_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_weight,ptr->cnb_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_chi,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_eps,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_deps,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_Gamma,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_dGamma,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_chi_dec,ptr->cnb_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_eps_dec,ptr->cnb_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_Gamma_dec,ptr->cnb_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_Gamma_0,ptr->cnb_size*sizeof(double),ptr->error_message);
+
+  class_alloc(pvecback,pba->bg_size*sizeof(double),ptr->error_message);
+
+  /** - sample the neutrino momentum with a Gauss-Laguerre rule, which
+      is well suited to the exponentially decaying Fermi-Dirac weight.
+      The weights returned here already contain \f$ f_0(q) \f$, so that
+      \f$ \sum_i w_i g(q_i) \simeq \int dq f_0(q) g(q) \f$, following the
+      same convention as pba->q_ncdm / pba->w_ncdm. */
+
+  {
+    double * w_laguerre;
+
+    class_alloc(w_laguerre,ptr->cnb_q_size*sizeof(double),ptr->error_message);
+
+    class_call(get_qsampling_manual(ptr->cnb_q,
+                                    w_laguerre,
+                                    ptr->cnb_q_size,
+                                    0.,
+                                    qm_Laguerre,
+                                    NULL,
+                                    0,
+                                    transfer_cnb_distribution,
+                                    NULL,
+                                    ptr->error_message),
+               ptr->error_message,
+               ptr->error_message);
+
+    /** - build the weights of the momentum average of eq. (3.2.38),
+        \f$ \propto q^2 E f_0(q) \f$, and normalise them to one for each
+        neutrino mass separately. The energy is evaluated today, so that
+        the average is weighted by the energy density of the neutrinos
+        as they are observed. */
+
+    for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
+
+      M = ppt->cnb_M[index_cnb];
+      weight_sum = 0.;
+
+      for (index_q_nu=0; index_q_nu < ptr->cnb_q_size; index_q_nu++) {
+
+        q = ptr->cnb_q[index_q_nu];
+        eps = sqrt(q*q+M*M);
+
+        ptr->cnb_weight[index_cnb*ptr->cnb_q_size+index_q_nu] = q*q*eps*w_laguerre[index_q_nu];
+        weight_sum += ptr->cnb_weight[index_cnb*ptr->cnb_q_size+index_q_nu];
+      }
+
+      /* The Gauss-Laguerre weights carry a factor exp(-q) which underflows
+         to zero once the rule has too many nodes (in practice above
+         ~90). Catch that here rather than letting it surface as a
+         division by zero. */
+      class_test(weight_sum <= 0.,
+                 ptr->error_message,
+                 "the CNB momentum weights of species %d sum up to %g: the Gauss-Laguerre rule has underflowed because 'cnb_q_size' (=%d) is too large. Use a smaller value (<= 80).",
+                 index_cnb,weight_sum,ptr->cnb_q_size);
+
+      for (index_q_nu=0; index_q_nu < ptr->cnb_q_size; index_q_nu++) {
+        ptr->cnb_weight[index_cnb*ptr->cnb_q_size+index_q_nu] /= weight_sum;
+      }
+    }
+
+    free(w_laguerre);
+  }
+
+  /** - locate neutrino decoupling */
+
+  class_call(background_tau_of_z(pba,ppt->cnb_z_dec,&(ptr->cnb_tau_dec)),
+             pba->error_message,
+             ptr->error_message);
+
+  class_test(ptr->cnb_tau_dec >= ppt->tau_sampling[0],
+             ptr->error_message,
+             "neutrino decoupling at z=%g corresponds to tau=%g, which is later than the first sampled time tau=%g; lower 'cnb_z_dec' or check your time sampling",
+             ppt->cnb_z_dec,ptr->cnb_tau_dec,ppt->tau_sampling[0]);
+
+  /** - tabulate the comoving energy and the phase-space logarithmic
+      derivative on the perturbation time sampling */
+
+  for (index_tau=0; index_tau < ptr->cnb_tau_size; index_tau++) {
+
+    class_call(background_at_tau(pba,
+                                 ppt->tau_sampling[index_tau],
+                                 short_info,
+                                 inter_normal,
+                                 &last_index,
+                                 pvecback),
+               pba->error_message,
+               ptr->error_message);
+
+    a = pvecback[pba->index_bg_a];
+    aH = pvecback[pba->index_bg_H]*a;
+
+    for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
+
+      M = ppt->cnb_M[index_cnb];
+
+      for (index_q_nu=0; index_q_nu < ptr->cnb_q_size; index_q_nu++) {
+
+        q = ptr->cnb_q[index_q_nu];
+        index_cnb_q = index_cnb*ptr->cnb_q_size+index_q_nu;
+
+        eps = sqrt(q*q+a*a*M*M);
+
+        ptr->cnb_eps[index_cnb_q*ptr->cnb_tau_size+index_tau] = eps;
+
+        /* eps^2 = q^2+a^2 M^2 with q constant, hence
+           d(eps)/d(tau) = a^2 M^2 aH/eps */
+        ptr->cnb_deps[index_cnb_q*ptr->cnb_tau_size+index_tau] = a*a*M*M*aH/eps;
+
+        {
+          double Gamma,dGamma_de;
+
+          class_call(transfer_cnb_Gamma(eps,&Gamma,&dGamma_de),
+                     ptr->error_message,
+                     ptr->error_message);
+
+          ptr->cnb_Gamma[index_cnb_q*ptr->cnb_tau_size+index_tau] = Gamma;
+
+          ptr->cnb_dGamma[index_cnb_q*ptr->cnb_tau_size+index_tau] =
+            dGamma_de*ptr->cnb_deps[index_cnb_q*ptr->cnb_tau_size+index_tau];
+        }
+      }
+    }
+  }
+
+  /** - integrate the neutrino comoving distance
+      \f$ \chi_\nu(\tau)=\int_\tau^{\tau_0} (q/\epsilon) d\tau' \f$
+      backwards from today, where it vanishes */
+
+  for (index_cnb_q=0; index_cnb_q < ptr->cnb_size; index_cnb_q++) {
+
+    q = ptr->cnb_q[index_cnb_q % ptr->cnb_q_size];
+
+    index_tau = ptr->cnb_tau_size-1;
+
+    /* the time sampling may stop marginally before today */
+    ptr->cnb_chi[index_cnb_q*ptr->cnb_tau_size+index_tau] =
+      (pba->conformal_age-ppt->tau_sampling[index_tau])
+      *q/ptr->cnb_eps[index_cnb_q*ptr->cnb_tau_size+index_tau];
+
+    for (index_tau=ptr->cnb_tau_size-2; index_tau >= 0; index_tau--) {
+
+      v = q/ptr->cnb_eps[index_cnb_q*ptr->cnb_tau_size+index_tau];
+      v_previous = q/ptr->cnb_eps[index_cnb_q*ptr->cnb_tau_size+index_tau+1];
+
+      ptr->cnb_chi[index_cnb_q*ptr->cnb_tau_size+index_tau] =
+        ptr->cnb_chi[index_cnb_q*ptr->cnb_tau_size+index_tau+1]
+        + 0.5*(v+v_previous)*(ppt->tau_sampling[index_tau+1]-ppt->tau_sampling[index_tau]);
+    }
+  }
+
+  /** - continue the integration below the first sampled time, down to
+      neutrino decoupling, to get the comoving distance to the neutrino
+      last scattering surface. This is the quantity that carries the
+      mass dependence of the Sachs-Wolfe term, cf. Fig. 4.4: heavier
+      neutrinos are slower and decoupled closer to us. */
+
+  for (index_cnb_q=0; index_cnb_q < ptr->cnb_size; index_cnb_q++) {
+    ptr->cnb_chi_dec[index_cnb_q] = ptr->cnb_chi[index_cnb_q*ptr->cnb_tau_size];
+  }
+
+  tau_previous = ppt->tau_sampling[0];
+
+  for (index_extra=extra_size-1; index_extra >= 0; index_extra--) {
+
+    /* logarithmic steps, since the scale factor varies by many orders
+       of magnitude between decoupling and the first sampled time */
+    tau = ptr->cnb_tau_dec*exp(((double)index_extra/(double)extra_size)
+                               *log(ppt->tau_sampling[0]/ptr->cnb_tau_dec));
+
+    dtau = tau_previous-tau;
+
+    class_call(background_at_tau(pba,
+                                 0.5*(tau+tau_previous),
+                                 short_info,
+                                 inter_normal,
+                                 &last_index,
+                                 pvecback),
+               pba->error_message,
+               ptr->error_message);
+
+    a = pvecback[pba->index_bg_a];
+
+    for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
+
+      M = ppt->cnb_M[index_cnb];
+
+      for (index_q_nu=0; index_q_nu < ptr->cnb_q_size; index_q_nu++) {
+
+        q = ptr->cnb_q[index_q_nu];
+        index_cnb_q = index_cnb*ptr->cnb_q_size+index_q_nu;
+
+        ptr->cnb_chi_dec[index_cnb_q] += dtau*q/sqrt(q*q+a*a*M*M);
+      }
+    }
+
+    tau_previous = tau;
+  }
+
+  /** - value of the comoving energy and of Gamma at decoupling and
+      today, needed by the Sachs-Wolfe term of eq. (3.2.24) and (3.2.32) */
+
+  class_call(background_at_tau(pba,
+                               ptr->cnb_tau_dec,
+                               short_info,
+                               inter_normal,
+                               &last_index,
+                               pvecback),
+             pba->error_message,
+             ptr->error_message);
+
+  a = pvecback[pba->index_bg_a];
+
+  for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
+
+    M = ppt->cnb_M[index_cnb];
+
+    for (index_q_nu=0; index_q_nu < ptr->cnb_q_size; index_q_nu++) {
+
+      q = ptr->cnb_q[index_q_nu];
+      index_cnb_q = index_cnb*ptr->cnb_q_size+index_q_nu;
+
+      ptr->cnb_eps_dec[index_cnb_q] = sqrt(q*q+a*a*M*M);
+
+      class_call(transfer_cnb_Gamma(ptr->cnb_eps_dec[index_cnb_q],
+                                    &(ptr->cnb_Gamma_dec[index_cnb_q]),
+                                    NULL),
+                 ptr->error_message,
+                 ptr->error_message);
+
+      class_call(transfer_cnb_Gamma(sqrt(q*q+M*M),
+                                    &(ptr->cnb_Gamma_0[index_cnb_q]),
+                                    NULL),
+                 ptr->error_message,
+                 ptr->error_message);
+    }
+  }
+
+  /** - super-horizon value of phi during radiation domination, per unit
+      primordial curvature perturbation */
+
+  index_md = ppt->index_md_scalars;
+  index_ic = ppt->index_ic_ad;
+
+  ptr->cnb_phi_dec =
+    pert_sources[index_md][index_ic*ppt->tp_size[index_md]+ppt->index_tp_phi][0];
+
+  class_test(ppt->k[index_md][0]*ppt->tau_sampling[0] > 1.e-2,
+             ptr->error_message,
+             "the CNB Sachs-Wolfe term anchors phi to its super-horizon value, read off at the smallest sampled wavenumber k=%g and the earliest sampled time tau=%g; but k*tau=%g there is not small enough for that to be accurate. Lower 'k_min_tau0' or start the source sampling earlier.",
+             ppt->k[index_md][0],ppt->tau_sampling[0],ppt->k[index_md][0]*ppt->tau_sampling[0]);
+
+  if (ptr->transfer_verbose > 0) {
+    printf(" -> CNB: %d neutrino mass(es), %s approach, decoupling at z=%g (tau=%g Mpc)\n",
+           ptr->cnb_num,
+           (ppt->cnb_approach == cnb_momentum_approach ? "momentum" : "energy"),
+           ppt->cnb_z_dec,ptr->cnb_tau_dec);
+    printf("    super-horizon phi at decoupling = %g (read at k=%g, tau=%g, k*tau=%g)\n",
+           ptr->cnb_phi_dec,ppt->k[index_md][0],ppt->tau_sampling[0],
+           ppt->k[index_md][0]*ppt->tau_sampling[0]);
+    for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
+      printf("    m_nu = %e eV: chi_nu(tau_dec) between %g and %g Mpc (CMB: %g Mpc)\n",
+             ppt->cnb_m_in_eV[index_cnb],
+             ptr->cnb_chi_dec[index_cnb*ptr->cnb_q_size],
+             ptr->cnb_chi_dec[index_cnb*ptr->cnb_q_size+ptr->cnb_q_size-1],
+             pba->conformal_age-ptr->cnb_tau_dec);
+    }
+  }
+
+  free(pvecback);
+
+  return _SUCCESS_;
+}
+
+/**
+ * Free the tables allocated by transfer_cnb_precompute().
+ *
+ * @param ptr Input: pointer to transfer structure
+ * @return the error status
+ */
+
+int transfer_cnb_free(
+                      struct transfer * ptr
+                      ) {
+
+  free(ptr->cnb_q);
+  free(ptr->cnb_weight);
+  free(ptr->cnb_chi);
+  free(ptr->cnb_eps);
+  free(ptr->cnb_deps);
+  free(ptr->cnb_Gamma);
+  free(ptr->cnb_dGamma);
+  free(ptr->cnb_chi_dec);
+  free(ptr->cnb_eps_dec);
+  free(ptr->cnb_Gamma_dec);
+  free(ptr->cnb_Gamma_0);
+
+  return _SUCCESS_;
+}
+
+/**
+ * Interpolate the metric perturbations entering the CNB sources at the
+ * wavenumber currently being processed, and infer psi' by splining psi
+ * in conformal time.
+ *
+ * phi' is taken directly from the perturbation module, which computes it
+ * exactly. psi' is not available there, so it is obtained numerically;
+ * the time sampling used here is the one designed to resolve the CMB
+ * integrated Sachs-Wolfe effect, which is precisely the regime where
+ * psi' matters.
+ *
+ * @param ppt                 Input: pointer to perturbation structure
+ * @param ptr                 Input: pointer to transfer structure
+ * @param ptw                 Input/Output: pointer to transfer workspace
+ * @param k                   Input: wavenumber
+ * @param index_md            Input: index of mode
+ * @param index_ic            Input: index of initial condition
+ * @param pert_sources        Input: array of perturbation sources
+ * @param pert_sources_spline Input: array of their second derivatives with respect to k
+ * @return the error status
+ */
+
+int transfer_cnb_interpolate_potentials(
+                                        struct perturbations * ppt,
+                                        struct transfer * ptr,
+                                        struct transfer_workspace * ptw,
+                                        double k,
+                                        int index_md,
+                                        int index_ic,
+                                        double *** pert_sources,
+                                        double *** pert_sources_spline
+                                        ) {
+
+  /** Summary: */
+
+  /** - define local variables */
+
+  int index_tau;
+  int index_tp;
+  double h;
+
+  /** - interpolate phi, phi' and psi at this wavenumber */
+
+  index_tp = index_ic*ppt->tp_size[index_md]+ppt->index_tp_phi;
+  class_call(transfer_interpolate_sources(ppt,ptr,k,index_md,index_ic,ppt->index_tp_phi,
+                                          pert_sources[index_md][index_tp],
+                                          pert_sources_spline[index_md][index_tp],
+                                          ptw->cnb_phi),
+             ptr->error_message,
+             ptr->error_message);
+
+  index_tp = index_ic*ppt->tp_size[index_md]+ppt->index_tp_phi_prime;
+  class_call(transfer_interpolate_sources(ppt,ptr,k,index_md,index_ic,ppt->index_tp_phi_prime,
+                                          pert_sources[index_md][index_tp],
+                                          pert_sources_spline[index_md][index_tp],
+                                          ptw->cnb_phi_prime),
+             ptr->error_message,
+             ptr->error_message);
+
+  index_tp = index_ic*ppt->tp_size[index_md]+ppt->index_tp_psi;
+  class_call(transfer_interpolate_sources(ppt,ptr,k,index_md,index_ic,ppt->index_tp_psi,
+                                          pert_sources[index_md][index_tp],
+                                          pert_sources_spline[index_md][index_tp],
+                                          ptw->cnb_psi),
+             ptr->error_message,
+             ptr->error_message);
+
+  /** - differentiate psi with respect to conformal time */
+
+  class_call(array_spline_table_columns(ppt->tau_sampling,
+                                        ptr->cnb_tau_size,
+                                        ptw->cnb_psi,
+                                        1,
+                                        ptw->cnb_ddpsi,
+                                        _SPLINE_EST_DERIV_,
+                                        ptr->error_message),
+             ptr->error_message,
+             ptr->error_message);
+
+  for (index_tau=0; index_tau < ptr->cnb_tau_size-1; index_tau++) {
+
+    h = ppt->tau_sampling[index_tau+1]-ppt->tau_sampling[index_tau];
+
+    ptw->cnb_psi_prime[index_tau] =
+      (ptw->cnb_psi[index_tau+1]-ptw->cnb_psi[index_tau])/h
+      - h/6.*(ptw->cnb_ddpsi[index_tau+1]+2.*ptw->cnb_ddpsi[index_tau]);
+  }
+
+  index_tau = ptr->cnb_tau_size-1;
+  h = ppt->tau_sampling[index_tau]-ppt->tau_sampling[index_tau-1];
+
+  ptw->cnb_psi_prime[index_tau] =
+    (ptw->cnb_psi[index_tau]-ptw->cnb_psi[index_tau-1])/h
+    + h/6.*(2.*ptw->cnb_ddpsi[index_tau]+ptw->cnb_ddpsi[index_tau-1]);
+
+  return _SUCCESS_;
+}
+
+/**
+ * Build the CNB transfer source for one neutrino mass, one neutrino
+ * momentum and one of the two contributions, together with the radial
+ * coordinate it must be convolved with.
+ *
+ * This implements eq. (3.2.24) in the momentum approach and eq. (3.2.32)
+ * in the energy approach:
+ *
+ * - the Sachs-Wolfe term is a Dirac at neutrino decoupling; it is
+ *   returned as a single-point source, which transfer_integrate()
+ *   handles by simply multiplying it by the Bessel function,
+ *   \f$ \Delta_\ell^{SW} = \frac{1}{2}\frac{\Gamma(\tau_{dec})}{\Gamma(\tau_0)}\phi_{dec}\, j_\ell(k\chi_\nu(\tau_{dec})) \f$
+ *   (the ratio of Gammas is one in the momentum approach, where Gamma
+ *   is time independent);
+ *
+ * - the integrated Sachs-Wolfe term is
+ *   \f$ \int d\tau\,[\psi' + \partial_\tau(\frac{\epsilon^2}{q^2}\phi)]\,j_\ell(k\chi_\nu(\tau)) \f$
+ *   in the momentum approach, and
+ *   \f$ \frac{1}{\Gamma(\tau_0)}\int d\tau\,[\frac{q^2}{\epsilon^2}\Gamma\psi' + \partial_\tau(\phi\Gamma)]\,j_\ell(k\chi_\nu(\tau)) \f$
+ *   in the energy approach.
+ *
+ * The radial coordinate handed back through tau0_minus_tau is the
+ * neutrino comoving distance \f$ \chi_\nu \f$ rather than
+ * \f$ \tau_0-\tau \f$, so that the rest of the transfer module convolves
+ * the source with \f$ j_\ell(k\chi_\nu) \f$ as required. The trapezoidal
+ * weights are then weights in \f$ d\chi_\nu \f$, so the source is
+ * multiplied by the Jacobian \f$ d\tau/d\chi_\nu = \epsilon/q \f$.
+ *
+ * @param ppt             Input: pointer to perturbation structure
+ * @param ptr             Input: pointer to transfer structure
+ * @param ptw             Input: pointer to transfer workspace, holding the interpolated potentials
+ * @param index_cnb       Input: index of the CNB species (i.e. of the neutrino mass)
+ * @param index_q_nu      Input: index of the neutrino momentum
+ * @param is_sw           Input: _TRUE_ for the Sachs-Wolfe term, _FALSE_ for the integrated one
+ * @param sources         Output: source function
+ * @param tau0_minus_tau  Output: radial coordinate, here the neutrino comoving distance
+ * @param w_trapz         Output: trapezoidal weights for the integration
+ * @param tau_size_out    Output: number of sampled times
+ * @return the error status
+ */
+
+int transfer_cnb_source(
+                        struct perturbations * ppt,
+                        struct transfer * ptr,
+                        struct transfer_workspace * ptw,
+                        int index_cnb,
+                        int index_q_nu,
+                        short is_sw,
+                        double * sources,
+                        double * tau0_minus_tau,
+                        double * w_trapz,
+                        int * tau_size_out
+                        ) {
+
+  /** Summary: */
+
+  /** - define local variables */
+
+  int index_tau;
+  int index_cnb_q;
+  int offset;
+
+  /* neutrino momentum, comoving energy and its time derivative */
+  double q,eps,deps;
+
+  /* phase-space logarithmic derivative and its time derivative */
+  double Gamma,dGamma;
+
+  /* physical source, before the change of integration variable */
+  double source;
+
+  index_cnb_q = index_cnb*ptr->cnb_q_size+index_q_nu;
+  offset = index_cnb_q*ptr->cnb_tau_size;
+
+  q = ptr->cnb_q[index_q_nu];
+
+  /** - Sachs-Wolfe term: a single point at neutrino decoupling */
+
+  if (is_sw == _TRUE_) {
+
+    *tau_size_out = 1;
+
+    tau0_minus_tau[0] = ptr->cnb_chi_dec[index_cnb_q];
+    w_trapz[0] = 1.;
+
+    /* Two contributions carry the angular dependence j_l(k chi_nu(tau_dec)):
+       the initial condition N(tau_dec) = phi(tau_dec)/2, and the lower
+       boundary term left over by the integration by parts. The latter is
+       written out in eq. (3.2.17) and (3.2.29) of the Thesis but is missing
+       from eq. (3.2.18) and (3.2.30); it is restored here.
+
+       The two approaches get different coefficients. In the momentum
+       approach the term to integrate by parts is -ikmu (E/p) phi Gamma,
+       which has to be rewritten as -(E/p)^2 d/dtau[exp(ikmu chi_nu)] phi
+       Gamma, leaving a boundary term (eps/q)^2 phi(tau_dec) Gamma. In the
+       energy approach the Boltzmann equation (3.2.28) carries an extra
+       p^2/E^2 which cancels that factor exactly, leaving simply
+       phi(tau_dec) Gamma(tau_dec).
+
+       Note that (eps/q)^2 at decoupling differs from one only by
+       a(tau_dec)^2 M^2/q^2 ~ 1e-15, so the momentum-approach coefficient is
+       3/2 for all practical purposes; it is kept exact here because it costs
+       nothing. */
+
+    if (ppt->cnb_approach == cnb_momentum_approach) {
+
+      eps = ptr->cnb_eps_dec[index_cnb_q];
+
+      sources[0] = (0.5 + eps*eps/(q*q))*ptr->cnb_phi_dec;
+    }
+    else {
+
+      sources[0] = 1.5*ptr->cnb_Gamma_dec[index_cnb_q]/ptr->cnb_Gamma_0[index_cnb_q]
+        *ptr->cnb_phi_dec;
+    }
+
+    return _SUCCESS_;
+  }
+
+  /** - integrated Sachs-Wolfe term: the full time sampling */
+
+  *tau_size_out = ptr->cnb_tau_size;
+
+  for (index_tau=0; index_tau < ptr->cnb_tau_size; index_tau++) {
+
+    eps = ptr->cnb_eps[offset+index_tau];
+    deps = ptr->cnb_deps[offset+index_tau];
+
+    if (ppt->cnb_approach == cnb_momentum_approach) {
+
+      /* psi' + d/dtau[(eps/q)^2 phi], expanded using
+         d(eps^2)/dtau = 2 eps deps */
+      source = ptw->cnb_psi_prime[index_tau]
+        + eps*eps/(q*q)*ptw->cnb_phi_prime[index_tau]
+        + 2.*eps*deps/(q*q)*ptw->cnb_phi[index_tau];
+    }
+    else {
+
+      Gamma = ptr->cnb_Gamma[offset+index_tau];
+      dGamma = ptr->cnb_dGamma[offset+index_tau];
+
+      /* [(q/eps)^2 Gamma psi' + d/dtau(phi Gamma)] / Gamma(tau_0) */
+      source = (q*q/(eps*eps)*Gamma*ptw->cnb_psi_prime[index_tau]
+                + Gamma*ptw->cnb_phi_prime[index_tau]
+                + dGamma*ptw->cnb_phi[index_tau])
+        /ptr->cnb_Gamma_0[index_cnb_q];
+    }
+
+    /* change of integration variable from tau to chi_nu */
+    sources[index_tau] = source*eps/q;
+
+    tau0_minus_tau[index_tau] = ptr->cnb_chi[offset+index_tau];
+  }
+
+  class_call(array_trapezoidal_mweights(tau0_minus_tau,
+                                        *tau_size_out,
+                                        w_trapz,
+                                        ptr->error_message),
+             ptr->error_message,
+             ptr->error_message);
+
+  return _SUCCESS_;
+}
+
+/**
+ * Compute the CNB transfer functions at one wavenumber, for every CNB
+ * species and every requested contribution, performing the average over
+ * the neutrino momentum of eq. (3.2.38) on the fly.
+ *
+ * The momentum average has to be done here rather than in the harmonic
+ * module because the neutrino comoving distance, and hence the argument
+ * of the Bessel functions, depends on the momentum: only after the
+ * Bessel convolution can the different momenta be combined. Doing the
+ * accumulation here also avoids storing one transfer function per
+ * momentum.
+ *
+ * @param ppr      Input: pointer to precision structure
+ * @param ppt      Input: pointer to perturbation structure
+ * @param ptr      Input/Output: pointer to transfer structure (result stored there)
+ * @param ptw      Input/Output: pointer to transfer workspace
+ * @param index_q  Input: index of wavenumber
+ * @param index_md Input: index of mode
+ * @param index_ic Input: index of initial condition
+ * @return the error status
+ */
+
+int transfer_cnb_compute_for_each_q(
+                                    struct precision * ppr,
+                                    struct perturbations * ppt,
+                                    struct transfer * ptr,
+                                    struct transfer_workspace * ptw,
+                                    int index_q,
+                                    int index_md,
+                                    int index_ic
+                                    ) {
+
+  /** Summary: */
+
+  /** - define local variables */
+
+  int index_cnb,index_q_nu,index_l,index_tt;
+
+  /* which of the two contributions we are dealing with */
+  int index_contribution;
+  short is_sw;
+
+  /* accumulator of the momentum average, one value per multipole */
+  double * transfer_accumulated;
+
+  double transfer_function;
+  double weight;
+  double l;
+  double q_max_bessel;
+
+  class_calloc(transfer_accumulated,
+               ptr->l_size[index_md],
+               sizeof(double),
+               ptr->error_message);
+
+  /* the CNB sources extend from neutrino decoupling to today, so none
+     of them may be cut at late times */
+  ptw->neglect_late_source = _FALSE_;
+
+  for (index_contribution=0; index_contribution < 2; index_contribution++) {
+
+    is_sw = (index_contribution == 0) ? _TRUE_ : _FALSE_;
+
+    if ((is_sw == _TRUE_) && (ppt->has_cnb_sw == _FALSE_)) continue;
+    if ((is_sw == _FALSE_) && (ppt->has_cnb_isw == _FALSE_)) continue;
+
+    for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
+
+      index_tt = (is_sw == _TRUE_) ?
+        ptr->index_tt_cnb_sw+index_cnb : ptr->index_tt_cnb_isw+index_cnb;
+
+      for (index_l=0; index_l < ptr->l_size[index_md]; index_l++) {
+        transfer_accumulated[index_l] = 0.;
+      }
+
+      /** - loop over neutrino momenta; each of them has its own radial
+            coordinate, hence its own Bessel convolution */
+
+      for (index_q_nu=0; index_q_nu < ptr->cnb_q_size; index_q_nu++) {
+
+        weight = ptr->cnb_weight[index_cnb*ptr->cnb_q_size+index_q_nu];
+
+        class_call(transfer_cnb_source(ppt,
+                                       ptr,
+                                       ptw,
+                                       index_cnb,
+                                       index_q_nu,
+                                       is_sw,
+                                       ptw->sources,
+                                       ptw->tau0_minus_tau,
+                                       ptw->w_trapz,
+                                       &(ptw->tau_size)),
+                   ptr->error_message,
+                   ptr->error_message);
+
+        class_call(transfer_radial_coordinates(ptr,ptw,index_md,index_q),
+                   ptr->error_message,
+                   ptr->error_message);
+
+        if (ptw->sgnK == 0) {
+          q_max_bessel = ptw->pBIS->x[ptw->pBIS->x_size-1]/ptw->tau0_minus_tau[0];
+        }
+        else {
+          q_max_bessel = ptr->q[ptr->q_size-1];
+        }
+
+        for (index_l=0; index_l < ptr->l_size[index_md]; index_l++) {
+
+          l = (double)ptr->l[index_l];
+
+          /* for K>0 (closed), transfer functions are only defined for l<nu */
+          if ((ptw->sgnK == 1) && (ptr->l[index_l] >= (int)(ptr->q[index_q]/sqrt(ptw->K)+0.2)))
+            continue;
+
+          if ((ptw->sgnK != 0) && (index_q < ptr->index_q_flat_approximation) && (index_l >= ptw->HIS.l_size))
+            continue;
+
+          class_call(transfer_compute_for_each_l(ptw,
+                                                 ppr,
+                                                 ppt,
+                                                 ptr,
+                                                 index_q,
+                                                 index_md,
+                                                 index_ic,
+                                                 index_tt,
+                                                 index_l,
+                                                 l,
+                                                 q_max_bessel,
+                                                 SCALAR_TEMPERATURE_0,
+                                                 _FALSE_,
+                                                 &transfer_function),
+                     ptr->error_message,
+                     ptr->error_message);
+
+          transfer_accumulated[index_l] += weight*transfer_function;
+        }
+      }
+
+      /** - store the momentum-averaged transfer function */
+
+      for (index_l=0; index_l < ptr->l_size[index_md]; index_l++) {
+
+        ptr->transfer[index_md][((index_ic * ptr->tt_size[index_md] + index_tt)
+                                 * ptr->l_size[index_md] + index_l)
+                                * ptr->q_size + index_q]
+          = transfer_accumulated[index_l];
+      }
+    }
+  }
+
+  free(transfer_accumulated);
 
   return _SUCCESS_;
 }

@@ -334,6 +334,16 @@ class_precision_parameter(perturbations_integration_stepsize,double,0.5)
  */
 class_precision_parameter(perturbations_sampling_stepsize,double,0.1)
 /**
+ * number of logarithmically spaced time steps prepended to the source
+ * sampling when the Cosmic Neutrino Background is requested, in order to
+ * reach deep inside the radiation era. The Sachs-Wolfe term of the CNB
+ * needs phi at neutrino decoupling, and the standard sampling only
+ * starts around z ~ 1400, where the super-horizon phi has already
+ * dropped by ~9/10 below its radiation-era plateau. The sources are
+ * smooth over that range, so a coarse logarithmic sampling is enough.
+ */
+class_precision_parameter(cnb_radiation_era_tau_size,int,40)
+/**
  * added in v 3.2.2: age fraction (between 0 and 1 ) such that, when
  * tau > conformal_age * age_fraction, the time sampling of sources is
  * twice finer, in order to boost the accuracy of the lensing

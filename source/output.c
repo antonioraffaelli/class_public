@@ -1704,6 +1704,7 @@ int output_open_cl_file(
   /** Summary */
 
   int index_d1,index_d2;
+  int index_n1;
   int colnum = 1;
   char tmp[60]; //A fixed number here is ok, since it should just correspond to the largest string which is printed to tmp.
 
@@ -1819,6 +1820,18 @@ int output_open_cl_file(
           class_sprintf(tmp,"dens[%d]-lens[%d]",index_d1+1,index_d2+1);
           class_fprintf_columntitle(*clfile,tmp,_TRUE_,colnum);
         }
+      }
+    }
+    if (phr->has_nn == _TRUE_){
+      for (index_n1=0; index_n1<phr->n_size; index_n1++){
+        class_sprintf(tmp,"nu[%.3eeV]-nu[%.3eeV]",phr->cnb_m_in_eV[index_n1],phr->cnb_m_in_eV[index_n1]);
+        class_fprintf_columntitle(*clfile,tmp,_TRUE_,colnum);
+      }
+    }
+    if (phr->has_tn == _TRUE_){
+      for (index_n1=0; index_n1<phr->n_size; index_n1++){
+        class_sprintf(tmp,"T-nu[%.3eeV]",phr->cnb_m_in_eV[index_n1]);
+        class_fprintf_columntitle(*clfile,tmp,_TRUE_,colnum);
       }
     }
     fprintf(*clfile,"\n");

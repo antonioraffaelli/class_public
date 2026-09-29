@@ -48,6 +48,23 @@ enum ncdmfa_method {ncdmfa_mb,ncdmfa_hu,ncdmfa_CLASS,ncdmfa_none};
 enum tensor_methods {tm_photons_only,tm_massless_approximation,tm_exact};
 enum vector_methods {vm_massless_approximation,vm_exact};
 
+/**
+ * Assumption made on the unperturbed neutrino phase-space distribution
+ * when deriving the Cosmic Neutrino Background (CNB) anisotropies.
+ *
+ * In the "momentum" approach the Fermi-Dirac distribution is written as
+ * a function of the comoving momentum q, i.e. the neutrino mass is
+ * neglected in f0; the logarithmic derivative
+ * \f$ \Gamma = d\ln f_0/d\ln q \f$ is then time independent.
+ *
+ * In the "energy" approach f0 is written as a function of the comoving
+ * energy \f$ \epsilon=\sqrt{q^2+a^2M^2} \f$, so that
+ * \f$ \Gamma = d\ln f_0/d\ln \epsilon \f$ acquires a time dependence and
+ * the ISW source is suppressed by the squared neutrino velocity
+ * \f$ v^2=q^2/\epsilon^2 \f$.
+ */
+enum cnb_approaches {cnb_momentum_approach,cnb_energy_approach};
+
 //@}
 
 /**
@@ -92,6 +109,12 @@ enum hierarchies {optimal, tam};
  */
 #define _SELECTION_NUM_MAX_ 100
 enum selection_type {gaussian,tophat,dirac};
+
+/**
+ * maximum number of neutrino masses for which the Cosmic Neutrino
+ * Background anisotropies can be computed in a single run
+ */
+#define _CNB_NUM_MAX_ 16
 
 //@}
 
@@ -161,6 +184,7 @@ struct perturbations
   short has_cl_cmb_lensing_potential; /**< do we need \f$ C_l \f$'s for CMB lensing potential? */
   short has_cl_lensing_potential;     /**< do we need \f$ C_l \f$'s for galaxy lensing potential? */
   short has_cl_number_count;          /**< do we need \f$ C_l \f$'s for density number count? */
+  short has_cl_cnb;                   /**< do we need \f$ C_l \f$'s for the Cosmic Neutrino Background? */
   short has_pk_matter;                /**< do we need matter Fourier spectrum? */
   short has_density_transfers;        /**< do we need to output individual matter density transfer functions? */
   short has_velocity_transfers;       /**< do we need to output individual matter velocity transfer functions? */
@@ -188,6 +212,24 @@ struct perturbations
   enum selection_type selection;                /**< type of selection functions */
   double selection_mean[_SELECTION_NUM_MAX_]; /**< centers of selection functions */
   double selection_width[_SELECTION_NUM_MAX_];  /**< widths of selection functions */
+
+  /** @name - parameters controlling the Cosmic Neutrino Background \f$ C_l \f$'s */
+
+  //@{
+
+  enum cnb_approaches cnb_approach; /**< assumption made on the neutrino phase-space distribution */
+
+  int cnb_num;                            /**< number of CNB "species", i.e. of neutrino masses for which the CNB anisotropies are computed */
+  double cnb_M[_CNB_NUM_MAX_];            /**< for each CNB species, dimensionless mass \f$ M=m_\nu/T_{\nu,0} \f$ */
+  double cnb_m_in_eV[_CNB_NUM_MAX_];      /**< for each CNB species, mass in eV (only used for printouts) */
+
+  double cnb_z_dec;   /**< redshift of neutrino decoupling, i.e. of the CNB "last scattering surface" */
+  int cnb_q_size;     /**< number of Gauss-Laguerre nodes used to sample the neutrino momentum in eq. (3.2.38) */
+
+  short has_cnb_sw;   /**< in the CNB calculation, do we want to include the Sachs-Wolfe term? */
+  short has_cnb_isw;  /**< in the CNB calculation, do we want to include the integrated Sachs-Wolfe term? */
+
+  //@}
 
   int switch_sw;   /**< in temperature calculation, do we want to include the intrinsic temperature + Sachs Wolfe term? */
   int switch_eisw; /**< in temperature calculation, do we want to include the early integrated Sachs Wolfe term? */
@@ -879,6 +921,17 @@ extern "C" {
                                struct thermodynamics * pth,
                                struct perturbations * ppt
                                );
+
+  int perturbations_cnb_indices(
+                                struct background * pba,
+                                struct perturbations * ppt
+                                );
+
+  int perturbations_prepend_radiation_era_sampling(
+                                                   struct precision * ppr,
+                                                   struct background * pba,
+                                                   struct perturbations * ppt
+                                                   );
 
   int perturbations_workspace_init(
                                    struct precision * ppr,

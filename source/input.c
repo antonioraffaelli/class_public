@@ -1767,11 +1767,14 @@ int input_read_parameters_general(struct file_content * pfc,
   /** - Define local variables */
   int flag1,flag2;
   double param1,param2;
+  int n,entries_read;
+  double * pointer1;
   char string1[_ARGUMENT_LENGTH_MAX_];
-  char * options_output[36] =  {"tCl","pCl","lCl","nCl","dCl","sCl","mPk","mTk","dTk","vTk","sd",
+  char * options_output[39] =  {"tCl","pCl","lCl","nCl","dCl","sCl","mPk","mTk","dTk","vTk","sd",
                                 "TCl","PCl","LCl","NCl","DCl","SCl","MPk","MTk","DTk","VTk","Sd",
                                 "TCL","PCL","LCL","NCL","DCL","SCL","MPK","MTK","DTK","VTK","SD",
-                                "wTk","WTk","WTK"};
+                                "wTk","WTk","WTK",
+                                "cnbCl","CNBCl","CNBCL"};
   char * options_temp_contributions[10] = {"tsw","eisw","lisw","dop","pol","TSW","EISW","LISW","Dop","Pol"};
   char * options_number_count[8] = {"density","dens","rsd","RSD","lensing","lens","gr","GR"};
   char * options_modes[6] = {"s","v","t","S","V","T"};
@@ -1838,14 +1841,19 @@ int input_read_parameters_general(struct file_content * pfc,
       ppt->has_vector_velocity_transfers=_TRUE_;
       ppt->has_perturbations = _TRUE_;
     }
+    if ((strstr(string1,"cnbCl") != NULL) || (strstr(string1,"CNBCl") != NULL) || (strstr(string1,"CNBCL") != NULL)) {
+      ppt->has_cl_cnb = _TRUE_;
+      ppt->has_perturbations = _TRUE_;
+      ppt->has_cls = _TRUE_;
+    }
 
 
     /* Test */
-    class_call(parser_check_options(string1, options_output, 36, &flag1),
+    class_call(parser_check_options(string1, options_output, 39, &flag1),
                errmsg,
                errmsg);
     class_test(flag1==_FALSE_,
-               errmsg, "The options for output are {'tCl','pCl','lCl','nCl','dCl','sCl','mPk','mTk','dTk','vTk','Sd','wTk'}, you entered '%s'",string1);
+               errmsg, "The options for output are {'tCl','pCl','lCl','nCl','dCl','sCl','mPk','mTk','dTk','vTk','Sd','wTk','cnbCl'}, you entered '%s'",string1);
   }
 
   /** 1.a) Terms contributing to the temperature spectrum */
@@ -1941,6 +1949,98 @@ int input_read_parameters_general(struct file_content * pfc,
       /* Set default value */
       ppt->has_nc_density = _TRUE_;
     }
+  }
+
+  /** 1.b bis) Cosmic Neutrino Background anisotropy spectrum */
+  if (ppt->has_cl_cnb == _TRUE_) {
+
+    /** 1.b.1) Assumption made on the neutrino phase-space distribution */
+    /* Read */
+    class_call(parser_read_string(pfc,"cnb_approach",&string1,&flag1,errmsg),
+               errmsg,
+               errmsg);
+    /* Complete set of parameters */
+    if (flag1 == _TRUE_) {
+      if ((strstr(string1,"momentum") != NULL) || (strstr(string1,"Momentum") != NULL)) {
+        ppt->cnb_approach = cnb_momentum_approach;
+      }
+      else if ((strstr(string1,"energy") != NULL) || (strstr(string1,"Energy") != NULL)) {
+        ppt->cnb_approach = cnb_energy_approach;
+      }
+      else {
+        class_stop(errmsg,
+                   "The options for 'cnb_approach' are {'momentum','energy'}, you entered '%s'",string1);
+      }
+    }
+
+    /** 1.b.2) Terms contributing to the CNB spectrum */
+    /* Read */
+    class_call(parser_read_string(pfc,"cnb_contributions",&string1,&flag1,errmsg),
+               errmsg,
+               errmsg);
+    /* Complete set of parameters */
+    if (flag1 == _TRUE_) {
+      ppt->has_cnb_sw = _FALSE_;
+      ppt->has_cnb_isw = _FALSE_;
+      if ((strstr(string1,"sw") != NULL) || (strstr(string1,"SW") != NULL)) {
+        ppt->has_cnb_sw = _TRUE_;
+      }
+      if ((strstr(string1,"isw") != NULL) || (strstr(string1,"ISW") != NULL)) {
+        ppt->has_cnb_isw = _TRUE_;
+      }
+      /* Test */
+      class_test((ppt->has_cnb_sw == _FALSE_) && (ppt->has_cnb_isw == _FALSE_),
+                 errmsg,
+                 "You specified 'cnb_contributions' as '%s'. It has to contain some of {'sw','isw'}.",string1);
+    }
+
+    /** 1.b.3) Neutrino masses entering the CNB spectrum, in eV. If
+        this list is absent, the ncdm species declared in the
+        background are used instead; that fallback is resolved in
+        perturbations_cnb_indices(), since the ncdm sector has not
+        been read yet at this stage. Giving the masses explicitly is
+        what one wants in order to scan the mass dependence of the CNB
+        spectrum without changing the cosmology. */
+    /* Read */
+    class_call(parser_read_list_of_doubles(pfc,"cnb_m_nu",&entries_read,&pointer1,&flag1,errmsg),
+               errmsg,
+               errmsg);
+    /* Complete set of parameters */
+    if (flag1 == _TRUE_) {
+      class_test(entries_read > _CNB_NUM_MAX_,
+                 errmsg,
+                 "'cnb_m_nu' has %d entries but at most %d neutrino masses can be treated in one run",
+                 entries_read,_CNB_NUM_MAX_);
+      ppt->cnb_num = entries_read;
+      for (n=0; n<entries_read; n++) {
+        class_test(pointer1[n] <= 0.,
+                   errmsg,
+                   "'cnb_m_nu' entry %d is %g eV; the CNB spectrum is only defined for a positive neutrino mass",
+                   n,pointer1[n]);
+        ppt->cnb_m_in_eV[n] = pointer1[n];
+      }
+      free(pointer1);
+    }
+
+    /** 1.b.4) Redshift of neutrino decoupling and sampling of the
+        neutrino momentum in the average of eq. (3.2.38) */
+    /* Read */
+    class_read_double("cnb_z_dec",ppt->cnb_z_dec);
+    class_read_int("cnb_q_size",ppt->cnb_q_size);
+    /* Test */
+    class_test(ppt->cnb_z_dec <= 0.,
+               errmsg,
+               "'cnb_z_dec' must be positive, you entered %g",ppt->cnb_z_dec);
+    class_test(ppt->cnb_q_size < _MIN_NUMBER_OF_LAGUERRE_POINTS_,
+               errmsg,
+               "'cnb_q_size' must be at least %d, you entered %d",
+               _MIN_NUMBER_OF_LAGUERRE_POINTS_,ppt->cnb_q_size);
+    /* above ~90 nodes the exp(-q) carried by the Gauss-Laguerre weights
+       underflows and the momentum average degenerates */
+    class_test(ppt->cnb_q_size > _MAX_NUMBER_OF_LAGUERRE_POINTS_,
+               errmsg,
+               "'cnb_q_size' must be at most %d (the Gauss-Laguerre weights underflow beyond that), you entered %d",
+               _MAX_NUMBER_OF_LAGUERRE_POINTS_,ppt->cnb_q_size);
   }
 
   /** 1.c) Transfer function of additional metric fluctuations */
@@ -4819,7 +4919,10 @@ int input_read_parameters_spectra(struct file_content * pfc,
   /* Read */
   if (ppt->has_cls == _TRUE_) {
     if (ppt->has_scalars == _TRUE_) {
-      if ((ppt->has_cl_cmb_temperature == _TRUE_) || (ppt->has_cl_cmb_polarization == _TRUE_) || (ppt->has_cl_cmb_lensing_potential == _TRUE_)){
+      /* the CNB spectra are also computed up to l_scalar_max, so that
+         they can be cross-correlated with the CMB temperature */
+      if ((ppt->has_cl_cmb_temperature == _TRUE_) || (ppt->has_cl_cmb_polarization == _TRUE_) ||
+          (ppt->has_cl_cmb_lensing_potential == _TRUE_) || (ppt->has_cl_cnb == _TRUE_)){
         class_read_double("l_max_scalars",ppt->l_scalar_max);
       }
       if ((ppt->has_cl_lensing_potential == _TRUE_) || (ppt->has_cl_number_count == _TRUE_)){
@@ -5829,6 +5932,7 @@ int input_default_params(struct background *pba,
   ppt->has_cl_cmb_polarization = _FALSE_;
   ppt->has_cl_cmb_lensing_potential = _FALSE_;
   ppt->has_cl_number_count = _FALSE_;
+  ppt->has_cl_cnb = _FALSE_;
   ppt->has_cl_lensing_potential = _FALSE_;
   ppt->has_pk_matter = _FALSE_;
   ppt->has_density_transfers = _FALSE_;
@@ -5847,6 +5951,14 @@ int input_default_params(struct background *pba,
   ppt->has_nc_rsd = _FALSE_;
   ppt->has_nc_lens = _FALSE_;
   ppt->has_nc_gr = _FALSE_;
+  /** 1.b bis) 'cnbCl' case */
+  ppt->cnb_approach = cnb_momentum_approach;
+  ppt->has_cnb_sw = _TRUE_;
+  ppt->has_cnb_isw = _TRUE_;
+  ppt->cnb_num = 0;  /* 0 means: infer the masses from the ncdm species */
+  /* neutrino decoupling happens around T ~ 1.5 MeV, i.e. z ~ 6e9 */
+  ppt->cnb_z_dec = 6.e9;
+  ppt->cnb_q_size = 30;
   /** 1.c) 'dTk' (or 'mTk') case */
   ppt->has_metricpotential_transfers = _FALSE_;
 

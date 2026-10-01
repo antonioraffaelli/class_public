@@ -5895,14 +5895,20 @@ int transfer_cnb_precompute(
     }
   }
 
-  /** - super-horizon value of phi during radiation domination, per unit
-      primordial curvature perturbation */
+  /** - super-horizon values of phi and psi during radiation domination, per
+      unit primordial curvature perturbation. The Sachs-Wolfe term needs psi,
+      the Newtonian (time-time) potential; psi and phi are *not*
+      interchangeable here, since the neutrino anisotropic stress splits them
+      by ~14% in the radiation era. */
 
   index_md = ppt->index_md_scalars;
   index_ic = ppt->index_ic_ad;
 
   ptr->cnb_phi_dec =
     pert_sources[index_md][index_ic*ppt->tp_size[index_md]+ppt->index_tp_phi][0];
+
+  ptr->cnb_psi_dec =
+    pert_sources[index_md][index_ic*ppt->tp_size[index_md]+ppt->index_tp_psi][0];
 
   class_test(ppt->k[index_md][0]*ppt->tau_sampling[0] > 1.e-2,
              ptr->error_message,
@@ -5914,8 +5920,9 @@ int transfer_cnb_precompute(
            ptr->cnb_num,
            (ppt->cnb_approach == cnb_momentum_approach ? "momentum" : "energy"),
            ppt->cnb_z_dec,ptr->cnb_tau_dec);
-    printf("    super-horizon phi at decoupling = %g (read at k=%g, tau=%g, k*tau=%g)\n",
-           ptr->cnb_phi_dec,ppt->k[index_md][0],ppt->tau_sampling[0],
+    printf("    super-horizon phi = %g, psi = %g at decoupling (read at k=%g, tau=%g, k*tau=%g)\n",
+           ptr->cnb_phi_dec,ptr->cnb_psi_dec,
+           ppt->k[index_md][0],ppt->tau_sampling[0],
            ppt->k[index_md][0]*ppt->tau_sampling[0]);
     for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
       printf("    m_nu = %e eV: chi_nu(tau_dec) between %g and %g Mpc (CMB: %g Mpc)\n",
@@ -6141,34 +6148,40 @@ int transfer_cnb_source(
     w_trapz[0] = 1.;
 
     /* Two contributions carry the angular dependence j_l(k chi_nu(tau_dec)):
-       the initial condition N(tau_dec) = phi(tau_dec)/2, and the lower
-       boundary term left over by the integration by parts. The latter is
-       written out in eq. (3.2.17) and (3.2.29) of the Thesis but is missing
-       from eq. (3.2.18) and (3.2.30); it is restored here.
+       the adiabatic initial condition, and the lower boundary term left over
+       by the integration by parts.
 
-       The two approaches get different coefficients. In the momentum
-       approach the term to integrate by parts is -ikmu (E/p) phi Gamma,
-       which has to be rewritten as -(E/p)^2 d/dtau[exp(ikmu chi_nu)] phi
-       Gamma, leaving a boundary term (eps/q)^2 phi(tau_dec) Gamma. In the
-       energy approach the Boltzmann equation (3.2.28) carries an extra
-       p^2/E^2 which cancels that factor exactly, leaving simply
-       phi(tau_dec) Gamma(tau_dec).
+       The initial condition is N(tau_dec) = Theta_0 = -psi(tau_dec)/2, where
+       psi is the Newtonian (time-time) potential: this is eq. (1.4.16) of the
+       Thesis, whose Phi is this psi (the Thesis calls the time-time potential
+       Phi and the spatial curvature perturbation Psi, i.e. the opposite way
+       round from CLASS and from Ma & Bertschinger). Note the minus sign; it is
+       the standard super-horizon adiabatic relation delta_nu = -2 psi, and it
+       can be read straight off CLASS as delta_ur/4 = -0.49958 psi.
 
-       Note that (eps/q)^2 at decoupling differs from one only by
-       a(tau_dec)^2 M^2/q^2 ~ 1e-15, so the momentum-approach coefficient is
-       3/2 for all practical purposes; it is kept exact here because it costs
-       nothing. */
+       The boundary term is +(eps_dec/q)^2 psi(tau_dec) in the momentum
+       approach: the term to integrate by parts is -ikmu (eps/q) psi Gamma,
+       rewritten as -(eps/q)^2 d/dtau[exp(ikmu chi_nu)] psi Gamma. In the
+       energy approach the Boltzmann equation carries an extra q^2/eps^2 which
+       cancels that factor exactly, leaving simply psi(tau_dec) Gamma(tau_dec).
+
+       Since (eps_dec/q)^2 differs from one only by a(tau_dec)^2 M^2/q^2 ~
+       1e-15, the two terms combine to +psi/2: this is the textbook
+       Sachs-Wolfe amplitude Theta_0 + psi, which is exactly what CLASS uses
+       for the CMB itself (see the 'switch_sw * g * (delta_g/4 + psi)' term in
+       perturbations_sources()). The (eps_dec/q)^2 is kept exact here because
+       it costs nothing. */
 
     if (ppt->cnb_approach == cnb_momentum_approach) {
 
       eps = ptr->cnb_eps_dec[index_cnb_q];
 
-      sources[0] = (0.5 + eps*eps/(q*q))*ptr->cnb_phi_dec;
+      sources[0] = (-0.5 + eps*eps/(q*q))*ptr->cnb_psi_dec;
     }
     else {
 
-      sources[0] = 1.5*ptr->cnb_Gamma_dec[index_cnb_q]/ptr->cnb_Gamma_0[index_cnb_q]
-        *ptr->cnb_phi_dec;
+      sources[0] = 0.5*ptr->cnb_Gamma_dec[index_cnb_q]/ptr->cnb_Gamma_0[index_cnb_q]
+        *ptr->cnb_psi_dec;
     }
 
     return _SUCCESS_;
@@ -6183,23 +6196,31 @@ int transfer_cnb_source(
     eps = ptr->cnb_eps[offset+index_tau];
     deps = ptr->cnb_deps[offset+index_tau];
 
+    /* Which potential goes where matters. The Boltzmann equation sources the
+       anisotropy with [phi' - (eps/q) ikmu psi], phi being the spatial
+       curvature perturbation and psi the Newtonian potential (CLASS and
+       Ma & Bertschinger naming). Integrating the second term by parts moves
+       the (eps/q)^2 onto psi, not onto phi. In the massless limit
+       (eps/q)^2 = 1 and both orderings collapse to the familiar phi' + psi',
+       which is why the distinction only shows up for massive neutrinos. */
+
     if (ppt->cnb_approach == cnb_momentum_approach) {
 
-      /* psi' + d/dtau[(eps/q)^2 phi], expanded using
+      /* phi' + d/dtau[(eps/q)^2 psi], expanded using
          d(eps^2)/dtau = 2 eps deps */
-      source = ptw->cnb_psi_prime[index_tau]
-        + eps*eps/(q*q)*ptw->cnb_phi_prime[index_tau]
-        + 2.*eps*deps/(q*q)*ptw->cnb_phi[index_tau];
+      source = ptw->cnb_phi_prime[index_tau]
+        + eps*eps/(q*q)*ptw->cnb_psi_prime[index_tau]
+        + 2.*eps*deps/(q*q)*ptw->cnb_psi[index_tau];
     }
     else {
 
       Gamma = ptr->cnb_Gamma[offset+index_tau];
       dGamma = ptr->cnb_dGamma[offset+index_tau];
 
-      /* [(q/eps)^2 Gamma psi' + d/dtau(phi Gamma)] / Gamma(tau_0) */
-      source = (q*q/(eps*eps)*Gamma*ptw->cnb_psi_prime[index_tau]
-                + Gamma*ptw->cnb_phi_prime[index_tau]
-                + dGamma*ptw->cnb_phi[index_tau])
+      /* [(q/eps)^2 Gamma phi' + d/dtau(psi Gamma)] / Gamma(tau_0) */
+      source = (q*q/(eps*eps)*Gamma*ptw->cnb_phi_prime[index_tau]
+                + Gamma*ptw->cnb_psi_prime[index_tau]
+                + dGamma*ptw->cnb_psi[index_tau])
         /ptr->cnb_Gamma_0[index_cnb_q];
     }
 

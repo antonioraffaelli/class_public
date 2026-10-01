@@ -192,6 +192,7 @@ struct transfer {
 
   double cnb_tau_dec;  /**< conformal time of neutrino decoupling */
   double cnb_phi_dec;  /**< super-horizon value of phi during radiation domination, per unit primordial curvature perturbation; this is phi(tau_dec,k) for every k of interest, since all of them are far outside the horizon at neutrino decoupling */
+  double cnb_psi_dec;  /**< same for psi, the Newtonian (time-time) potential, which is the one entering the Sachs-Wolfe term; it differs from phi by the neutrino anisotropic stress, psi/phi ~ 0.86 in the radiation era */
 
   //@}
 

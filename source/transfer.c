@@ -197,14 +197,14 @@ int transfer_init(
   if ((ppt->has_cl_cnb == _TRUE_) && (ppt->has_scalars == _TRUE_)) {
     ptr->has_cnb = _TRUE_;
     ptr->cnb_num = ppt->cnb_num;
-    ptr->cnb_q_size = ppt->cnb_q_size;
-    ptr->cnb_size = ptr->cnb_num*ptr->cnb_q_size;
+    /* the momentum sampling, hence cnb_size, is only known once
+       transfer_cnb_precompute() has run */
+    ptr->cnb_size = 0;
     ptr->cnb_tau_size = ppt->tau_size;
   }
   else {
     ptr->has_cnb = _FALSE_;
     ptr->cnb_num = 0;
-    ptr->cnb_q_size = 0;
     ptr->cnb_size = 0;
     ptr->cnb_tau_size = 0;
   }
@@ -5578,6 +5578,249 @@ int transfer_cnb_Gamma(
 }
 
 /**
+ * Sample the neutrino momentum of one CNB species with composite
+ * Gauss-Legendre panels adapted to the neutrino comoving distance.
+ *
+ * Each momentum contributes through \f$ j_l(k\chi_\nu(\tau,q)) \f$, so
+ * the integrand of the momentum average oscillates in q at the rate
+ * \f$ k\,\partial\chi_\nu/\partial\ln q \f$. For a massive neutrino
+ * \f$ \chi_\nu \f$ varies steeply at small q (slow neutrinos travel much
+ * less far), which a Gauss-Laguerre rule tuned to \f$ e^{-q} \f$ cannot
+ * follow. Here the panel edges are placed where the Bessel phase has
+ * advanced by cnb_q_phase_step since the previous edge.
+ *
+ * The phase rate is evaluated where it is largest. The Bessel functions
+ * matter for \f$ k\chi_\nu \gtrsim l \f$, so the relevant wavenumber at
+ * multipole l_max is \f$ l_{max}/\chi_\nu \f$, but no larger than the
+ * largest wavenumber actually integrated over. The rate is maximised over
+ * all sampled times, not just decoupling: a neutrino that is
+ * non-relativistic today has \f$ \chi_\nu(\tau,q)\propto q \f$ at late
+ * times, twice as steep in ln q as \f$ \chi_\nu(\tau_{dec},q)\propto\sqrt q \f$.
+ *
+ * Only momenta that matter need their phase resolved. The phase rate is
+ * therefore scaled down where the effective weight per unit ln q,
+ * \f$ u(q)=q\cdot q^2\epsilon f_0\cdot(1+M^2/q^2) \f$, falls below
+ * cnb_q_weight_tol times its maximum; the last factor is the
+ * \f$ (\epsilon/q)^2 \f$ of the ISW source today, which keeps u finite
+ * as \f$ q\to0 \f$. Without it, the non-relativistic sliver
+ * \f$ q<M \f$ of even a nearly massless species, with a negligible
+ * weight but a steep \f$ \chi_\nu(q) \f$ over many e-folds of q, would
+ * claim thousands of nodes.
+ *
+ * Extra panel edges keep \f$ \Delta q\le1 \f$ and \f$ \Delta\ln q\le1/2 \f$,
+ * so that the weight \f$ q^2\epsilon f_0(q) \f$ itself is resolved where
+ * the phase varies slowly (light neutrinos, and the high-momentum tail).
+ *
+ * @param ppt        Input: pointer to perturbation structure
+ * @param ptr        Input: pointer to transfer structure
+ * @param M          Input: dimensionless neutrino mass \f$ m_\nu/T_{\nu,0} \f$
+ * @param tau0       Input: conformal age of the universe
+ * @param a_tau      Input: scale factor at each time of ppt->tau_sampling
+ * @param a_extra    Input: scale factor at the midpoints of the steps below the first sampled time
+ * @param dtau_extra Input: size of those steps
+ * @param extra_size Input: number of those steps
+ * @param q_out      Output: allocated here, the sampled momenta
+ * @param w_out      Output: allocated here, their weights (not normalised)
+ * @param n_out      Output: number of sampled momenta
+ * @return the error status
+ */
+
+int transfer_cnb_q_sampling_chi(
+                                struct perturbations * ppt,
+                                struct transfer * ptr,
+                                double M,
+                                double tau0,
+                                double * a_tau,
+                                double * a_extra,
+                                double * dtau_extra,
+                                int extra_size,
+                                double ** q_out,
+                                double ** w_out,
+                                int * n_out
+                                ) {
+
+  /* fine logarithmic grid on which the phase rate is evaluated */
+  int fine_size = 1000;
+  double q_fine_min = 1.e-4;
+
+  /* resolution of the weight itself */
+  double dq_max = 1.;
+  double dlnq_max = 0.5;
+
+  int index_md = ppt->index_md_scalars;
+  double l_max = (double)ppt->l_scalar_max;
+  double k_max = ppt->k[index_md][ppt->k_size[index_md]-1];
+
+  double * q_fine;
+  double * rate;
+  double * phase;
+  double u,u_max;
+  double * edges;
+  int edge_size,edge_size_max;
+
+  double gl_x[_CNB_PANEL_ORDER_MAX_],gl_w[_CNB_PANEL_ORDER_MAX_];
+  int n_gl = ppt->cnb_q_panel_order;
+
+  int index_fine,index_tau,index_extra,index_edge,index_gl,index_node;
+  double q,a,eps,chi,dchi,v,v_next,dv,dv_next,rate_max;
+  double q_next,phase_target,frac,lnq;
+  double qa,qb,f0;
+
+  class_alloc(q_fine,fine_size*sizeof(double),ptr->error_message);
+  class_alloc(rate,fine_size*sizeof(double),ptr->error_message);
+  class_alloc(phase,fine_size*sizeof(double),ptr->error_message);
+
+  /** - largest phase rate over time, k * d(chi_nu)/d(ln q), on the fine grid */
+
+  for (index_fine=0; index_fine < fine_size; index_fine++) {
+
+    q = q_fine_min*exp((double)index_fine/(double)(fine_size-1)*log(ppt->cnb_q_max/q_fine_min));
+    q_fine[index_fine] = q;
+
+    /* chi_nu and d(chi_nu)/d(ln q) = q int a^2 M^2/eps^3 dtau, integrated
+       backwards from today exactly as transfer_cnb_precompute() does it */
+    index_tau = ptr->cnb_tau_size-1;
+    a = a_tau[index_tau];
+    eps = sqrt(q*q+a*a*M*M);
+    v = q/eps;
+    dv = q*a*a*M*M/(eps*eps*eps);
+    chi = (tau0-ppt->tau_sampling[index_tau])*v;
+    dchi = (tau0-ppt->tau_sampling[index_tau])*dv;
+    rate_max = MIN(l_max/chi,k_max)*dchi;
+
+    for (index_tau=ptr->cnb_tau_size-2; index_tau >= 0; index_tau--) {
+      v_next = v;
+      dv_next = dv;
+      a = a_tau[index_tau];
+      eps = sqrt(q*q+a*a*M*M);
+      v = q/eps;
+      dv = q*a*a*M*M/(eps*eps*eps);
+      chi += 0.5*(v+v_next)*(ppt->tau_sampling[index_tau+1]-ppt->tau_sampling[index_tau]);
+      dchi += 0.5*(dv+dv_next)*(ppt->tau_sampling[index_tau+1]-ppt->tau_sampling[index_tau]);
+      rate_max = MAX(rate_max,MIN(l_max/chi,k_max)*dchi);
+    }
+
+    for (index_extra=extra_size-1; index_extra >= 0; index_extra--) {
+      a = a_extra[index_extra];
+      eps = sqrt(q*q+a*a*M*M);
+      chi += dtau_extra[index_extra]*q/eps;
+      dchi += dtau_extra[index_extra]*q*a*a*M*M/(eps*eps*eps);
+    }
+    rate_max = MAX(rate_max,MIN(l_max/chi,k_max)*dchi);
+
+    rate[index_fine] = rate_max;
+  }
+
+  /** - scale it down where the effective weight is negligible */
+
+  u_max = 0.;
+  for (index_fine=0; index_fine < fine_size; index_fine++) {
+    q = q_fine[index_fine];
+    class_call(transfer_cnb_distribution(NULL,q,&f0),
+               ptr->error_message,
+               ptr->error_message);
+    u = q*q*q*sqrt(q*q+M*M)*f0*(1.+M*M/(q*q));
+    phase[index_fine] = u;
+    u_max = MAX(u_max,u);
+  }
+
+  for (index_fine=0; index_fine < fine_size; index_fine++) {
+    rate[index_fine] *= MIN(1.,phase[index_fine]/(ppt->cnb_q_weight_tol*u_max));
+  }
+
+  /** - cumulative phase, in units of the phase step */
+
+  phase[0] = 0.;
+  for (index_fine=1; index_fine < fine_size; index_fine++) {
+    phase[index_fine] = phase[index_fine-1]
+      + 0.5*(rate[index_fine]+rate[index_fine-1])*log(q_fine[index_fine]/q_fine[index_fine-1])
+      /ppt->cnb_q_phase_step;
+  }
+
+  /** - panel edges: one where the phase crosses each integer, plus the
+      extra edges that resolve the weight */
+
+  edge_size_max = (int)phase[fine_size-1]
+    + (int)(log(ppt->cnb_q_max/q_fine_min)/dlnq_max)
+    + (int)(ppt->cnb_q_max/dq_max)
+    + 4;
+  class_alloc(edges,edge_size_max*sizeof(double),ptr->error_message);
+
+  /* the first panel, [0,q_fine_min], carries a negligible weight */
+  edges[0] = 0.;
+  edges[1] = q_fine_min;
+  edge_size = 2;
+  phase_target = 1.;
+  index_fine = 0;
+
+  while (edges[edge_size-1] < ppt->cnb_q_max*(1.-1.e-12)) {
+
+    q = edges[edge_size-1];
+
+    /* next phase crossing beyond q */
+    while ((index_fine < fine_size-1) && (phase[index_fine+1] < phase_target))
+      index_fine++;
+    if (index_fine < fine_size-1) {
+      frac = (phase_target-phase[index_fine])/(phase[index_fine+1]-phase[index_fine]);
+      lnq = log(q_fine[index_fine]) + frac*log(q_fine[index_fine+1]/q_fine[index_fine]);
+      q_next = exp(lnq);
+    }
+    else {
+      q_next = ppt->cnb_q_max;
+    }
+
+    q_next = MIN(q_next,q*exp(dlnq_max));
+    q_next = MIN(q_next,q+dq_max);
+    q_next = MIN(q_next,ppt->cnb_q_max);
+
+    class_test(edge_size >= edge_size_max,
+               ptr->error_message,
+               "too many momentum panels (%d) for the CNB species of mass M=%g", edge_size, M);
+
+    edges[edge_size] = q_next;
+    edge_size++;
+
+    /* the phase target only moves on once it has been reached */
+    while (phase_target <= phase[index_fine] + (phase[MIN(index_fine+1,fine_size-1)]-phase[index_fine])
+           *log(q_next/q_fine[index_fine])/log(q_fine[MIN(index_fine+1,fine_size-1)]/q_fine[index_fine]) + 1.e-12)
+      phase_target += 1.;
+  }
+
+  /** - Gauss-Legendre nodes in each panel, weighted by q^2 eps f0(q) */
+
+  class_call(quadrature_gauss_legendre(gl_x,gl_w,n_gl,_PI_*1.e-3*_EPSILON_,ptr->error_message),
+             ptr->error_message,
+             ptr->error_message);
+
+  *n_out = (edge_size-1)*n_gl;
+  class_alloc(*q_out,(*n_out)*sizeof(double),ptr->error_message);
+  class_alloc(*w_out,(*n_out)*sizeof(double),ptr->error_message);
+
+  index_node = 0;
+  for (index_edge=0; index_edge < edge_size-1; index_edge++) {
+    qa = edges[index_edge];
+    qb = edges[index_edge+1];
+    for (index_gl=0; index_gl < n_gl; index_gl++) {
+      q = 0.5*(qa+qb) + 0.5*(qb-qa)*gl_x[index_gl];
+      eps = sqrt(q*q+M*M);
+      class_call(transfer_cnb_distribution(NULL,q,&f0),
+                 ptr->error_message,
+                 ptr->error_message);
+      (*q_out)[index_node] = q;
+      (*w_out)[index_node] = 0.5*(qb-qa)*gl_w[index_gl]*q*q*eps*f0;
+      index_node++;
+    }
+  }
+
+  free(q_fine);
+  free(rate);
+  free(phase);
+  free(edges);
+
+  return _SUCCESS_;
+}
+
+/**
  * Precompute everything that the CNB transfer functions need and that
  * does not depend on the wavenumber: the neutrino momentum grid and its
  * weights, and, for each (neutrino mass, momentum) pair, the tables of
@@ -5634,9 +5877,20 @@ int transfer_cnb_precompute(
   double * pvecback;
   int last_index;
 
+  /* background tabulated on the time sampling, and on the steps that
+     extend chi_nu below the first sampled time */
+  double * a_tau;
+  double * aH_tau;
+  double * a_extra;
+  double * dtau_extra;
+
+  /* momenta and weights of each species, before they are flattened */
+  double * q_species[_CNB_NUM_MAX_];
+  double * w_species[_CNB_NUM_MAX_];
+
   /* quantities used to extend chi_nu below the first sampled time */
   int index_extra;
-  double tau,tau_previous,dtau;
+  double tau,tau_previous;
 
   /* number of steps used to integrate chi_nu between neutrino
      decoupling and the first sampled time */
@@ -5644,82 +5898,7 @@ int transfer_cnb_precompute(
 
   ptr->cnb_tau_size = ppt->tau_size;
 
-  /** - allocate the tables */
-
-  class_alloc(ptr->cnb_q,ptr->cnb_q_size*sizeof(double),ptr->error_message);
-  class_alloc(ptr->cnb_weight,ptr->cnb_size*sizeof(double),ptr->error_message);
-  class_alloc(ptr->cnb_chi,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
-  class_alloc(ptr->cnb_eps,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
-  class_alloc(ptr->cnb_deps,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
-  class_alloc(ptr->cnb_Gamma,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
-  class_alloc(ptr->cnb_dGamma,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
-  class_alloc(ptr->cnb_chi_dec,ptr->cnb_size*sizeof(double),ptr->error_message);
-  class_alloc(ptr->cnb_eps_dec,ptr->cnb_size*sizeof(double),ptr->error_message);
-  class_alloc(ptr->cnb_Gamma_dec,ptr->cnb_size*sizeof(double),ptr->error_message);
-  class_alloc(ptr->cnb_Gamma_0,ptr->cnb_size*sizeof(double),ptr->error_message);
-
   class_alloc(pvecback,pba->bg_size*sizeof(double),ptr->error_message);
-
-  /** - sample the neutrino momentum with a Gauss-Laguerre rule, which
-      is well suited to the exponentially decaying Fermi-Dirac weight.
-      The weights returned here already contain \f$ f_0(q) \f$, so that
-      \f$ \sum_i w_i g(q_i) \simeq \int dq f_0(q) g(q) \f$, following the
-      same convention as pba->q_ncdm / pba->w_ncdm. */
-
-  {
-    double * w_laguerre;
-
-    class_alloc(w_laguerre,ptr->cnb_q_size*sizeof(double),ptr->error_message);
-
-    class_call(get_qsampling_manual(ptr->cnb_q,
-                                    w_laguerre,
-                                    ptr->cnb_q_size,
-                                    0.,
-                                    qm_Laguerre,
-                                    NULL,
-                                    0,
-                                    transfer_cnb_distribution,
-                                    NULL,
-                                    ptr->error_message),
-               ptr->error_message,
-               ptr->error_message);
-
-    /** - build the weights of the momentum average of eq. (3.2.38),
-        \f$ \propto q^2 E f_0(q) \f$, and normalise them to one for each
-        neutrino mass separately. The energy is evaluated today, so that
-        the average is weighted by the energy density of the neutrinos
-        as they are observed. */
-
-    for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
-
-      M = ppt->cnb_M[index_cnb];
-      weight_sum = 0.;
-
-      for (index_q_nu=0; index_q_nu < ptr->cnb_q_size; index_q_nu++) {
-
-        q = ptr->cnb_q[index_q_nu];
-        eps = sqrt(q*q+M*M);
-
-        ptr->cnb_weight[index_cnb*ptr->cnb_q_size+index_q_nu] = q*q*eps*w_laguerre[index_q_nu];
-        weight_sum += ptr->cnb_weight[index_cnb*ptr->cnb_q_size+index_q_nu];
-      }
-
-      /* The Gauss-Laguerre weights carry a factor exp(-q) which underflows
-         to zero once the rule has too many nodes (in practice above
-         ~90). Catch that here rather than letting it surface as a
-         division by zero. */
-      class_test(weight_sum <= 0.,
-                 ptr->error_message,
-                 "the CNB momentum weights of species %d sum up to %g: the Gauss-Laguerre rule has underflowed because 'cnb_q_size' (=%d) is too large. Use a smaller value (<= 80).",
-                 index_cnb,weight_sum,ptr->cnb_q_size);
-
-      for (index_q_nu=0; index_q_nu < ptr->cnb_q_size; index_q_nu++) {
-        ptr->cnb_weight[index_cnb*ptr->cnb_q_size+index_q_nu] /= weight_sum;
-      }
-    }
-
-    free(w_laguerre);
-  }
 
   /** - locate neutrino decoupling */
 
@@ -5732,8 +5911,10 @@ int transfer_cnb_precompute(
              "neutrino decoupling at z=%g corresponds to tau=%g, which is later than the first sampled time tau=%g; lower 'cnb_z_dec' or check your time sampling",
              ppt->cnb_z_dec,ptr->cnb_tau_dec,ppt->tau_sampling[0]);
 
-  /** - tabulate the comoving energy and the phase-space logarithmic
-      derivative on the perturbation time sampling */
+  /** - tabulate the background on the perturbation time sampling */
+
+  class_alloc(a_tau,ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+  class_alloc(aH_tau,ptr->cnb_tau_size*sizeof(double),ptr->error_message);
 
   for (index_tau=0; index_tau < ptr->cnb_tau_size; index_tau++) {
 
@@ -5746,17 +5927,183 @@ int transfer_cnb_precompute(
                pba->error_message,
                ptr->error_message);
 
-    a = pvecback[pba->index_bg_a];
-    aH = pvecback[pba->index_bg_H]*a;
+    a_tau[index_tau] = pvecback[pba->index_bg_a];
+    aH_tau[index_tau] = pvecback[pba->index_bg_H]*a_tau[index_tau];
+  }
+
+  /** - and on logarithmic steps between neutrino decoupling and the first
+      sampled time, since the scale factor varies by many orders of
+      magnitude there. Step index_extra runs from tau_extra(index_extra)
+      to tau_extra(index_extra+1), the last one ending on the first
+      sampled time; the scale factor is taken at its midpoint. */
+
+  class_alloc(a_extra,extra_size*sizeof(double),ptr->error_message);
+  class_alloc(dtau_extra,extra_size*sizeof(double),ptr->error_message);
+
+  tau_previous = ppt->tau_sampling[0];
+
+  for (index_extra=extra_size-1; index_extra >= 0; index_extra--) {
+
+    tau = ptr->cnb_tau_dec*exp(((double)index_extra/(double)extra_size)
+                               *log(ppt->tau_sampling[0]/ptr->cnb_tau_dec));
+
+    dtau_extra[index_extra] = tau_previous-tau;
+
+    class_call(background_at_tau(pba,
+                                 0.5*(tau+tau_previous),
+                                 short_info,
+                                 inter_normal,
+                                 &last_index,
+                                 pvecback),
+               pba->error_message,
+               ptr->error_message);
+
+    a_extra[index_extra] = pvecback[pba->index_bg_a];
+
+    tau_previous = tau;
+  }
+
+  /** - sample the neutrino momentum of each species, and build the
+      weights of the momentum average of eq. (3.2.38),
+      \f$ \propto q^2 E f_0(q) \f$. The energy is evaluated today, so that
+      the average is weighted by the energy density of the neutrinos as
+      they are observed. */
+
+  class_alloc(ptr->cnb_q_num,ptr->cnb_num*sizeof(int),ptr->error_message);
+  class_alloc(ptr->cnb_q_offset,ptr->cnb_num*sizeof(int),ptr->error_message);
+
+  if (ppt->cnb_q_sampling == cnb_q_laguerre) {
+
+    /* Gauss-Laguerre rule, well suited to the exponentially decaying
+       Fermi-Dirac weight. The weights returned here already contain
+       f_0(q), so that sum_i w_i g(q_i) ~ int dq f_0(q) g(q), following the
+       same convention as pba->q_ncdm / pba->w_ncdm. The same momenta are
+       used for every species. */
+
+    double * q_laguerre;
+    double * w_laguerre;
+
+    class_alloc(q_laguerre,ppt->cnb_q_size*sizeof(double),ptr->error_message);
+    class_alloc(w_laguerre,ppt->cnb_q_size*sizeof(double),ptr->error_message);
+
+    class_call(get_qsampling_manual(q_laguerre,
+                                    w_laguerre,
+                                    ppt->cnb_q_size,
+                                    0.,
+                                    qm_Laguerre,
+                                    NULL,
+                                    0,
+                                    transfer_cnb_distribution,
+                                    NULL,
+                                    ptr->error_message),
+               ptr->error_message,
+               ptr->error_message);
+
+    for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
+
+      M = ppt->cnb_M[index_cnb];
+      ptr->cnb_q_num[index_cnb] = ppt->cnb_q_size;
+
+      class_alloc(q_species[index_cnb],ppt->cnb_q_size*sizeof(double),ptr->error_message);
+      class_alloc(w_species[index_cnb],ppt->cnb_q_size*sizeof(double),ptr->error_message);
+
+      for (index_q_nu=0; index_q_nu < ppt->cnb_q_size; index_q_nu++) {
+        q = q_laguerre[index_q_nu];
+        eps = sqrt(q*q+M*M);
+        q_species[index_cnb][index_q_nu] = q;
+        w_species[index_cnb][index_q_nu] = q*q*eps*w_laguerre[index_q_nu];
+      }
+    }
+
+    free(q_laguerre);
+    free(w_laguerre);
+  }
+  else {
+
+    for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
+
+      class_call(transfer_cnb_q_sampling_chi(ppt,
+                                             ptr,
+                                             ppt->cnb_M[index_cnb],
+                                             pba->conformal_age,
+                                             a_tau,
+                                             a_extra,
+                                             dtau_extra,
+                                             extra_size,
+                                             &(q_species[index_cnb]),
+                                             &(w_species[index_cnb]),
+                                             &(ptr->cnb_q_num[index_cnb])),
+                 ptr->error_message,
+                 ptr->error_message);
+    }
+  }
+
+  /** - flatten the momenta of all species into one table, normalising
+      the weights to one for each neutrino mass separately */
+
+  ptr->cnb_size = 0;
+  for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
+    ptr->cnb_q_offset[index_cnb] = ptr->cnb_size;
+    ptr->cnb_size += ptr->cnb_q_num[index_cnb];
+  }
+
+  class_alloc(ptr->cnb_q,ptr->cnb_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_weight,ptr->cnb_size*sizeof(double),ptr->error_message);
+
+  for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
+
+    weight_sum = 0.;
+    for (index_q_nu=0; index_q_nu < ptr->cnb_q_num[index_cnb]; index_q_nu++) {
+      weight_sum += w_species[index_cnb][index_q_nu];
+    }
+
+    /* The Gauss-Laguerre weights carry a factor exp(-q) which underflows
+       to zero once the rule has too many nodes (in practice above
+       ~90). Catch that here rather than letting it surface as a
+       division by zero. */
+    class_test(weight_sum <= 0.,
+               ptr->error_message,
+               "the CNB momentum weights of species %d sum up to %g: the Gauss-Laguerre rule has underflowed because 'cnb_q_size' (=%d) is too large. Use a smaller value (<= 80).",
+               index_cnb,weight_sum,ppt->cnb_q_size);
+
+    for (index_q_nu=0; index_q_nu < ptr->cnb_q_num[index_cnb]; index_q_nu++) {
+      index_cnb_q = ptr->cnb_q_offset[index_cnb]+index_q_nu;
+      ptr->cnb_q[index_cnb_q] = q_species[index_cnb][index_q_nu];
+      ptr->cnb_weight[index_cnb_q] = w_species[index_cnb][index_q_nu]/weight_sum;
+    }
+
+    free(q_species[index_cnb]);
+    free(w_species[index_cnb]);
+  }
+
+  /** - allocate the tables */
+
+  class_alloc(ptr->cnb_chi,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_eps,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_deps,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_Gamma,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_dGamma,ptr->cnb_size*ptr->cnb_tau_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_chi_dec,ptr->cnb_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_eps_dec,ptr->cnb_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_Gamma_dec,ptr->cnb_size*sizeof(double),ptr->error_message);
+  class_alloc(ptr->cnb_Gamma_0,ptr->cnb_size*sizeof(double),ptr->error_message);
+
+  /** - tabulate the comoving energy and the phase-space logarithmic
+      derivative on the perturbation time sampling */
+
+  for (index_tau=0; index_tau < ptr->cnb_tau_size; index_tau++) {
+
+    a = a_tau[index_tau];
+    aH = aH_tau[index_tau];
 
     for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
 
       M = ppt->cnb_M[index_cnb];
 
-      for (index_q_nu=0; index_q_nu < ptr->cnb_q_size; index_q_nu++) {
+      for (index_q_nu=0; index_q_nu < ptr->cnb_q_num[index_cnb]; index_q_nu++) {
 
-        q = ptr->cnb_q[index_q_nu];
-        index_cnb_q = index_cnb*ptr->cnb_q_size+index_q_nu;
+        index_cnb_q = ptr->cnb_q_offset[index_cnb]+index_q_nu;
+        q = ptr->cnb_q[index_cnb_q];
 
         eps = sqrt(q*q+a*a*M*M);
 
@@ -5788,7 +6135,7 @@ int transfer_cnb_precompute(
 
   for (index_cnb_q=0; index_cnb_q < ptr->cnb_size; index_cnb_q++) {
 
-    q = ptr->cnb_q[index_cnb_q % ptr->cnb_q_size];
+    q = ptr->cnb_q[index_cnb_q];
 
     index_tau = ptr->cnb_tau_size-1;
 
@@ -5814,46 +6161,22 @@ int transfer_cnb_precompute(
       mass dependence of the Sachs-Wolfe term, cf. Fig. 4.4: heavier
       neutrinos are slower and decoupled closer to us. */
 
-  for (index_cnb_q=0; index_cnb_q < ptr->cnb_size; index_cnb_q++) {
-    ptr->cnb_chi_dec[index_cnb_q] = ptr->cnb_chi[index_cnb_q*ptr->cnb_tau_size];
-  }
+  for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
 
-  tau_previous = ppt->tau_sampling[0];
+    M = ppt->cnb_M[index_cnb];
 
-  for (index_extra=extra_size-1; index_extra >= 0; index_extra--) {
+    for (index_q_nu=0; index_q_nu < ptr->cnb_q_num[index_cnb]; index_q_nu++) {
 
-    /* logarithmic steps, since the scale factor varies by many orders
-       of magnitude between decoupling and the first sampled time */
-    tau = ptr->cnb_tau_dec*exp(((double)index_extra/(double)extra_size)
-                               *log(ppt->tau_sampling[0]/ptr->cnb_tau_dec));
+      index_cnb_q = ptr->cnb_q_offset[index_cnb]+index_q_nu;
+      q = ptr->cnb_q[index_cnb_q];
 
-    dtau = tau_previous-tau;
+      ptr->cnb_chi_dec[index_cnb_q] = ptr->cnb_chi[index_cnb_q*ptr->cnb_tau_size];
 
-    class_call(background_at_tau(pba,
-                                 0.5*(tau+tau_previous),
-                                 short_info,
-                                 inter_normal,
-                                 &last_index,
-                                 pvecback),
-               pba->error_message,
-               ptr->error_message);
-
-    a = pvecback[pba->index_bg_a];
-
-    for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
-
-      M = ppt->cnb_M[index_cnb];
-
-      for (index_q_nu=0; index_q_nu < ptr->cnb_q_size; index_q_nu++) {
-
-        q = ptr->cnb_q[index_q_nu];
-        index_cnb_q = index_cnb*ptr->cnb_q_size+index_q_nu;
-
-        ptr->cnb_chi_dec[index_cnb_q] += dtau*q/sqrt(q*q+a*a*M*M);
+      for (index_extra=extra_size-1; index_extra >= 0; index_extra--) {
+        a = a_extra[index_extra];
+        ptr->cnb_chi_dec[index_cnb_q] += dtau_extra[index_extra]*q/sqrt(q*q+a*a*M*M);
       }
     }
-
-    tau_previous = tau;
   }
 
   /** - value of the comoving energy and of Gamma at decoupling and
@@ -5874,10 +6197,10 @@ int transfer_cnb_precompute(
 
     M = ppt->cnb_M[index_cnb];
 
-    for (index_q_nu=0; index_q_nu < ptr->cnb_q_size; index_q_nu++) {
+    for (index_q_nu=0; index_q_nu < ptr->cnb_q_num[index_cnb]; index_q_nu++) {
 
-      q = ptr->cnb_q[index_q_nu];
-      index_cnb_q = index_cnb*ptr->cnb_q_size+index_q_nu;
+      index_cnb_q = ptr->cnb_q_offset[index_cnb]+index_q_nu;
+      q = ptr->cnb_q[index_cnb_q];
 
       ptr->cnb_eps_dec[index_cnb_q] = sqrt(q*q+a*a*M*M);
 
@@ -5894,6 +6217,11 @@ int transfer_cnb_precompute(
                  ptr->error_message);
     }
   }
+
+  free(a_tau);
+  free(aH_tau);
+  free(a_extra);
+  free(dtau_extra);
 
   /** - super-horizon values of phi and psi during radiation domination, per
       unit primordial curvature perturbation. The Sachs-Wolfe term needs psi,
@@ -5916,19 +6244,21 @@ int transfer_cnb_precompute(
              ppt->k[index_md][0],ppt->tau_sampling[0],ppt->k[index_md][0]*ppt->tau_sampling[0]);
 
   if (ptr->transfer_verbose > 0) {
-    printf(" -> CNB: %d neutrino mass(es), %s approach, decoupling at z=%g (tau=%g Mpc)\n",
+    printf(" -> CNB: %d neutrino mass(es), %s approach, decoupling at z=%g (tau=%g Mpc), %d sampled times\n",
            ptr->cnb_num,
            (ppt->cnb_approach == cnb_momentum_approach ? "momentum" : "energy"),
-           ppt->cnb_z_dec,ptr->cnb_tau_dec);
+           ppt->cnb_z_dec,ptr->cnb_tau_dec,ptr->cnb_tau_size);
     printf("    super-horizon phi = %g, psi = %g at decoupling (read at k=%g, tau=%g, k*tau=%g)\n",
            ptr->cnb_phi_dec,ptr->cnb_psi_dec,
            ppt->k[index_md][0],ppt->tau_sampling[0],
            ppt->k[index_md][0]*ppt->tau_sampling[0]);
     for (index_cnb=0; index_cnb < ptr->cnb_num; index_cnb++) {
-      printf("    m_nu = %e eV: chi_nu(tau_dec) between %g and %g Mpc (CMB: %g Mpc)\n",
+      printf("    m_nu = %e eV: %d momenta (%s sampling), chi_nu(tau_dec) between %g and %g Mpc (CMB: %g Mpc)\n",
              ppt->cnb_m_in_eV[index_cnb],
-             ptr->cnb_chi_dec[index_cnb*ptr->cnb_q_size],
-             ptr->cnb_chi_dec[index_cnb*ptr->cnb_q_size+ptr->cnb_q_size-1],
+             ptr->cnb_q_num[index_cnb],
+             (ppt->cnb_q_sampling == cnb_q_laguerre ? "laguerre" : "chi"),
+             ptr->cnb_chi_dec[ptr->cnb_q_offset[index_cnb]],
+             ptr->cnb_chi_dec[ptr->cnb_q_offset[index_cnb]+ptr->cnb_q_num[index_cnb]-1],
              pba->conformal_age-ptr->cnb_tau_dec);
     }
   }
@@ -5949,6 +6279,8 @@ int transfer_cnb_free(
                       struct transfer * ptr
                       ) {
 
+  free(ptr->cnb_q_num);
+  free(ptr->cnb_q_offset);
   free(ptr->cnb_q);
   free(ptr->cnb_weight);
   free(ptr->cnb_chi);
@@ -6133,10 +6465,10 @@ int transfer_cnb_source(
   /* physical source, before the change of integration variable */
   double source;
 
-  index_cnb_q = index_cnb*ptr->cnb_q_size+index_q_nu;
+  index_cnb_q = ptr->cnb_q_offset[index_cnb]+index_q_nu;
   offset = index_cnb_q*ptr->cnb_tau_size;
 
-  q = ptr->cnb_q[index_q_nu];
+  q = ptr->cnb_q[index_cnb_q];
 
   /** - Sachs-Wolfe term: a single point at neutrino decoupling */
 
@@ -6318,9 +6650,9 @@ int transfer_cnb_compute_for_each_q(
       /** - loop over neutrino momenta; each of them has its own radial
             coordinate, hence its own Bessel convolution */
 
-      for (index_q_nu=0; index_q_nu < ptr->cnb_q_size; index_q_nu++) {
+      for (index_q_nu=0; index_q_nu < ptr->cnb_q_num[index_cnb]; index_q_nu++) {
 
-        weight = ptr->cnb_weight[index_cnb*ptr->cnb_q_size+index_q_nu];
+        weight = ptr->cnb_weight[ptr->cnb_q_offset[index_cnb]+index_q_nu];
 
         class_call(transfer_cnb_source(ppt,
                                        ptr,

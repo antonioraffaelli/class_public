@@ -164,28 +164,31 @@ struct transfer {
       which depends on both the neutrino mass and its momentum. All the
       quantities below are therefore tabulated for each pair
       (CNB species, neutrino momentum), flattened as
-      index_cnb*ptr->cnb_q_size+index_q_nu, and are independent of the
-      wavenumber k. */
+      index_cnb_q = cnb_q_offset[index_cnb]+index_q_nu, and are independent
+      of the wavenumber k. Each species may have its own number of
+      momenta, cnb_q_num[index_cnb]: with the chi sampling, heavier
+      neutrinos need many more of them. */
 
   //@{
 
   short has_cnb;      /**< do we compute CNB transfer functions in this run? */
 
   int cnb_num;        /**< number of CNB species (copy of ppt->cnb_num) */
-  int cnb_q_size;     /**< number of sampled neutrino momenta (copy of ppt->cnb_q_size) */
-  int cnb_size;       /**< cnb_num*cnb_q_size, i.e. size of the tables below */
+  int * cnb_q_num;    /**< cnb_q_num[index_cnb]: number of sampled neutrino momenta for this species */
+  int * cnb_q_offset; /**< cnb_q_offset[index_cnb]: index of the first momentum of this species in the flattened tables below */
+  int cnb_size;       /**< sum of cnb_q_num over species, i.e. size of the tables below */
   int cnb_tau_size;   /**< number of time values in the tables below (copy of ppt->tau_size) */
 
-  double * cnb_q;     /**< cnb_q[index_q_nu]: sampled comoving momenta, in units of \f$ T_{\nu,0} \f$ */
-  double * cnb_weight;/**< cnb_weight[index_cnb*cnb_q_size+index_q_nu]: normalised weights \f$ q^2\epsilon f_0(q) \f$ of the momentum average, eq. (3.2.38) */
+  double * cnb_q;     /**< cnb_q[index_cnb_q]: sampled comoving momenta, in units of \f$ T_{\nu,0} \f$ */
+  double * cnb_weight;/**< cnb_weight[index_cnb_q]: normalised weights \f$ q^2\epsilon f_0(q) \f$ of the momentum average, eq. (3.2.38) */
 
-  double * cnb_chi;   /**< cnb_chi[(index_cnb*cnb_q_size+index_q_nu)*cnb_tau_size+index_tau]: neutrino comoving distance \f$ \chi_\nu(\tau) \f$, sampled on ppt->tau_sampling */
+  double * cnb_chi;   /**< cnb_chi[index_cnb_q*cnb_tau_size+index_tau]: neutrino comoving distance \f$ \chi_\nu(\tau) \f$, sampled on ppt->tau_sampling */
   double * cnb_eps;   /**< same layout: comoving energy \f$ \epsilon=\sqrt{q^2+a^2M^2} \f$ */
   double * cnb_deps;  /**< same layout: conformal time derivative \f$ d\epsilon/d\tau = a^2M^2\mathcal{H}/\epsilon \f$ */
   double * cnb_Gamma; /**< same layout: \f$ \Gamma=d\ln f_0/d\ln\epsilon \f$ of the energy approach (unused in the momentum approach) */
   double * cnb_dGamma;/**< same layout: conformal time derivative of the above */
 
-  double * cnb_chi_dec;   /**< cnb_chi_dec[index_cnb*cnb_q_size+index_q_nu]: comoving distance to the neutrino last scattering surface, \f$ \chi_\nu(\tau_{dec}) \f$ */
+  double * cnb_chi_dec;   /**< cnb_chi_dec[index_cnb_q]: comoving distance to the neutrino last scattering surface, \f$ \chi_\nu(\tau_{dec}) \f$ */
   double * cnb_eps_dec;   /**< same layout: comoving energy at neutrino decoupling */
   double * cnb_Gamma_dec; /**< same layout: \f$ \Gamma \f$ at neutrino decoupling */
   double * cnb_Gamma_0;   /**< same layout: \f$ \Gamma \f$ today */
@@ -800,6 +803,20 @@ extern "C" {
                      double cotKgen,
                      double* f_evo
                      );
+
+  int transfer_cnb_q_sampling_chi(
+                                  struct perturbations * ppt,
+                                  struct transfer * ptr,
+                                  double M,
+                                  double tau0,
+                                  double * a_tau,
+                                  double * a_extra,
+                                  double * dtau_extra,
+                                  int extra_size,
+                                  double ** q_out,
+                                  double ** w_out,
+                                  int * n_out
+                                  );
 
   int transfer_cnb_precompute(
                               struct precision * ppr,

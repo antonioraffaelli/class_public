@@ -1982,8 +1982,17 @@ int input_read_parameters_general(struct file_content * pfc,
     if (flag1 == _TRUE_) {
       ppt->has_cnb_sw = _FALSE_;
       ppt->has_cnb_isw = _FALSE_;
-      if ((strstr(string1,"sw") != NULL) || (strstr(string1,"SW") != NULL)) {
-        ppt->has_cnb_sw = _TRUE_;
+      /* "isw" contains "sw", so an occurrence of "sw" only selects the
+         Sachs-Wolfe term when it is not the tail of "isw" */
+      {
+        char * sw_match;
+        for (sw_match = string1; *sw_match != '\0'; sw_match++) {
+          if (((sw_match[0] == 's') || (sw_match[0] == 'S')) &&
+              ((sw_match[1] == 'w') || (sw_match[1] == 'W')) &&
+              ((sw_match == string1) || ((sw_match[-1] != 'i') && (sw_match[-1] != 'I')))) {
+            ppt->has_cnb_sw = _TRUE_;
+          }
+        }
       }
       if ((strstr(string1,"isw") != NULL) || (strstr(string1,"ISW") != NULL)) {
         ppt->has_cnb_isw = _TRUE_;
@@ -2026,21 +2035,57 @@ int input_read_parameters_general(struct file_content * pfc,
         neutrino momentum in the average of eq. (3.2.38) */
     /* Read */
     class_read_double("cnb_z_dec",ppt->cnb_z_dec);
+    class_call(parser_read_string(pfc,"cnb_q_sampling",&string1,&flag1,errmsg),
+               errmsg,
+               errmsg);
+    if (flag1 == _TRUE_) {
+      if ((strstr(string1,"laguerre") != NULL) || (strstr(string1,"Laguerre") != NULL)) {
+        ppt->cnb_q_sampling = cnb_q_laguerre;
+      }
+      else if ((strstr(string1,"chi") != NULL) || (strstr(string1,"Chi") != NULL)) {
+        ppt->cnb_q_sampling = cnb_q_chi;
+      }
+      else {
+        class_stop(errmsg,
+                   "The options for 'cnb_q_sampling' are {'laguerre','chi'}, you entered '%s'",string1);
+      }
+    }
     class_read_int("cnb_q_size",ppt->cnb_q_size);
+    class_read_double("cnb_q_phase_step",ppt->cnb_q_phase_step);
+    class_read_int("cnb_q_panel_order",ppt->cnb_q_panel_order);
+    class_read_double("cnb_q_max",ppt->cnb_q_max);
+    class_read_double("cnb_q_weight_tol",ppt->cnb_q_weight_tol);
     /* Test */
     class_test(ppt->cnb_z_dec <= 0.,
                errmsg,
                "'cnb_z_dec' must be positive, you entered %g",ppt->cnb_z_dec);
-    class_test(ppt->cnb_q_size < _MIN_NUMBER_OF_LAGUERRE_POINTS_,
-               errmsg,
-               "'cnb_q_size' must be at least %d, you entered %d",
-               _MIN_NUMBER_OF_LAGUERRE_POINTS_,ppt->cnb_q_size);
-    /* above ~90 nodes the exp(-q) carried by the Gauss-Laguerre weights
-       underflows and the momentum average degenerates */
-    class_test(ppt->cnb_q_size > _MAX_NUMBER_OF_LAGUERRE_POINTS_,
-               errmsg,
-               "'cnb_q_size' must be at most %d (the Gauss-Laguerre weights underflow beyond that), you entered %d",
-               _MAX_NUMBER_OF_LAGUERRE_POINTS_,ppt->cnb_q_size);
+    if (ppt->cnb_q_sampling == cnb_q_laguerre) {
+      class_test(ppt->cnb_q_size < _MIN_NUMBER_OF_LAGUERRE_POINTS_,
+                 errmsg,
+                 "'cnb_q_size' must be at least %d, you entered %d",
+                 _MIN_NUMBER_OF_LAGUERRE_POINTS_,ppt->cnb_q_size);
+      /* above ~90 nodes the exp(-q) carried by the Gauss-Laguerre weights
+         underflows and the momentum average degenerates */
+      class_test(ppt->cnb_q_size > _MAX_NUMBER_OF_LAGUERRE_POINTS_,
+                 errmsg,
+                 "'cnb_q_size' must be at most %d (the Gauss-Laguerre weights underflow beyond that), you entered %d",
+                 _MAX_NUMBER_OF_LAGUERRE_POINTS_,ppt->cnb_q_size);
+    }
+    else {
+      class_test(ppt->cnb_q_phase_step <= 0.,
+                 errmsg,
+                 "'cnb_q_phase_step' must be positive, you entered %g",ppt->cnb_q_phase_step);
+      class_test((ppt->cnb_q_panel_order < 1) || (ppt->cnb_q_panel_order > _CNB_PANEL_ORDER_MAX_),
+                 errmsg,
+                 "'cnb_q_panel_order' must be between 1 and %d, you entered %d",
+                 _CNB_PANEL_ORDER_MAX_,ppt->cnb_q_panel_order);
+      class_test((ppt->cnb_q_weight_tol <= 0.) || (ppt->cnb_q_weight_tol >= 1.),
+                 errmsg,
+                 "'cnb_q_weight_tol' must be between 0 and 1, you entered %g",ppt->cnb_q_weight_tol);
+      class_test(ppt->cnb_q_max <= 1.,
+                 errmsg,
+                 "'cnb_q_max' must be well above the typical momentum q ~ 3, you entered %g",ppt->cnb_q_max);
+    }
   }
 
   /** 1.c) Transfer function of additional metric fluctuations */
@@ -5958,7 +6003,13 @@ int input_default_params(struct background *pba,
   ppt->cnb_num = 0;  /* 0 means: infer the masses from the ncdm species */
   /* neutrino decoupling happens around T ~ 1.5 MeV, i.e. z ~ 6e9 */
   ppt->cnb_z_dec = 6.e9;
+  ppt->cnb_q_sampling = cnb_q_laguerre;
   ppt->cnb_q_size = 30;
+  ppt->cnb_q_phase_step = 4.;
+  ppt->cnb_q_panel_order = 4;
+  /* q^2 eps f0(q) has fallen by ~1e-9 from its peak at q = 25 */
+  ppt->cnb_q_max = 25.;
+  ppt->cnb_q_weight_tol = 1.e-3;
   /** 1.c) 'dTk' (or 'mTk') case */
   ppt->has_metricpotential_transfers = _FALSE_;
 

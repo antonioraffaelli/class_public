@@ -65,6 +65,17 @@ enum vector_methods {vm_massless_approximation,vm_exact};
  */
 enum cnb_approaches {cnb_momentum_approach,cnb_energy_approach};
 
+/**
+ * Sampling of the neutrino momentum in the average of eq. (3.2.38).
+ *
+ * "laguerre" uses a Gauss-Laguerre rule, adapted to the smooth weight
+ * exp(-q). "chi" places composite Gauss-Legendre panels in q so that the
+ * phase k chi_nu(tau,q) of the Bessel functions advances by a fixed step
+ * across each panel: for massive neutrinos chi_nu varies steeply at small
+ * q, where the Gauss-Laguerre nodes are too sparse to follow it.
+ */
+enum cnb_q_samplings {cnb_q_laguerre,cnb_q_chi};
+
 //@}
 
 /**
@@ -115,6 +126,7 @@ enum selection_type {gaussian,tophat,dirac};
  * Background anisotropies can be computed in a single run
  */
 #define _CNB_NUM_MAX_ 16
+#define _CNB_PANEL_ORDER_MAX_ 10 /**< maximum number of Gauss-Legendre nodes per panel in the chi sampling of the CNB momentum */
 
 //@}
 
@@ -224,7 +236,12 @@ struct perturbations
   double cnb_m_in_eV[_CNB_NUM_MAX_];      /**< for each CNB species, mass in eV (only used for printouts) */
 
   double cnb_z_dec;   /**< redshift of neutrino decoupling, i.e. of the CNB "last scattering surface" */
-  int cnb_q_size;     /**< number of Gauss-Laguerre nodes used to sample the neutrino momentum in eq. (3.2.38) */
+  enum cnb_q_samplings cnb_q_sampling; /**< how the neutrino momentum is sampled in eq. (3.2.38) */
+  int cnb_q_size;     /**< number of Gauss-Laguerre nodes used to sample the neutrino momentum in eq. (3.2.38) (laguerre sampling only) */
+  double cnb_q_phase_step; /**< chi sampling: maximum advance of the Bessel phase \f$ k\chi_\nu \f$ across one momentum panel, at the multipole and wavenumber where it is largest */
+  int cnb_q_panel_order;   /**< chi sampling: number of Gauss-Legendre nodes per momentum panel */
+  double cnb_q_max;        /**< chi sampling: largest sampled momentum, in units of \f$ T_{\nu,0} \f$ */
+  double cnb_q_weight_tol; /**< chi sampling: the phase is resolved only where the effective weight per unit ln q exceeds this fraction of its maximum */
 
   short has_cnb_sw;   /**< in the CNB calculation, do we want to include the Sachs-Wolfe term? */
   short has_cnb_isw;  /**< in the CNB calculation, do we want to include the integrated Sachs-Wolfe term? */

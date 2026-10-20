@@ -35,7 +35,13 @@ cnb_approach      = momentum          # default; 'energy' is not recommended
 cnb_contributions = sw, isw           # optional, default is both
 cnb_m_nu          = 1.e-5, 1.e-4, 1.e-3, 4.e-3   # eV; default: the ncdm masses
 cnb_z_dec         = 6.e9              # neutrino decoupling redshift
-cnb_q_size        = 15                # Gauss-Laguerre nodes in q
+cnb_q_sampling    = laguerre          # default; 'chi' is accurate for heavy masses (Sec. 5)
+cnb_q_size        = 15                # laguerre only: Gauss-Laguerre nodes in q
+cnb_q_phase_step  = 4                 # chi only: Bessel phase per momentum panel
+cnb_q_panel_order = 4                 # chi only: Gauss-Legendre nodes per panel
+cnb_q_weight_tol  = 1.e-3             # chi only: phase resolved where weight > tol*max
+cnb_q_max         = 25                # chi only: largest sampled q/T_nu0
+k_max_tau0_over_l_max = 12            # needed for any CNB run: the default 1.5 truncates C_l^nunu
 ```
 
 A ready-made input file using the cosmological parameters of Table 4.1 is
@@ -285,13 +291,15 @@ not requested, no CNB code runs.
 
 ### `source/input.c`
 - `cnbCl` added to the `output` keywords.
-- reads `cnb_approach`, `cnb_contributions`, `cnb_m_nu`, `cnb_z_dec`, `cnb_q_size`,
+- reads `cnb_approach`, `cnb_contributions`, `cnb_m_nu`, `cnb_z_dec`, `cnb_q_sampling`,
+  `cnb_q_size`, `cnb_q_phase_step`, `cnb_q_panel_order`, `cnb_q_weight_tol`, `cnb_q_max`,
   with defaults set in `input_default_params()`.
 
 ### `include/transfer.h`
 - transfer types `index_tt_cnb_sw`, `index_tt_cnb_isw` (one per neutrino mass).
 - `cnb_psi_dec` alongside `cnb_phi_dec`: the SW term needs **psi** (Sec. 3.1).
-- the free-streaming tables, flattened as `index_cnb*cnb_q_size + index_q_nu`:
+- the free-streaming tables, flattened as `cnb_q_offset[index_cnb] + index_q_nu`
+  (each species has its own `cnb_q_num[index_cnb]` momenta under the chi sampling):
   `cnb_q`, `cnb_weight`, `cnb_chi`, `cnb_eps`, `cnb_deps`, `cnb_Gamma`,
   `cnb_dGamma`, `cnb_chi_dec`, `cnb_eps_dec`, `cnb_Gamma_dec`, `cnb_Gamma_0`,
   plus `cnb_tau_dec` and `cnb_phi_dec`.
@@ -351,7 +359,7 @@ Existing routines touched:
   `m_nu`, `nn` and `tn` (the last two of shape `(n_mass, lmax+1)`).
 
 ### `explanatory.ini`
-- documentation of `cnbCl` and of the five `cnb_*` parameters.
+- documentation of `cnbCl` and of the `cnb_*` parameters.
 
 ---
 
@@ -408,25 +416,46 @@ as the different momenta decohere.
 a negative `C_l^{Tnu}` at low `l`, suppressed above `l ~ 20`, while the energy
 approach is positive and strongly suppressed — as described in Sec. 4.3.
 
-**Convergence of the momentum average.** This is the weak point of the
-implementation. Relative to a 60-node run, the default `cnb_q_size = 30` gives:
+**Convergence of the momentum average.** With the default Gauss-Laguerre sampling
+this is the weak point of the implementation. For a massive neutrino `chi_nu(q)`
+varies steeply at small `q`, so `Delta_l(q)` oscillates rapidly in `q`, and a rule
+tuned to the smooth weight `exp(-q)` cannot follow it. Comparing Laguerre runs with
+each other (30 vs 60 nodes) badly *understates* the problem, because the 60-node
+reference is itself far from converged.
 
-| `m_nu` | `l = 2` | `l = 10` | `l = 50` | `l = 150` |
-|---|---|---|---|---|
-| 1e-5 eV | 2e-8 | 7e-8 | 3e-6 | 3e-7 |
-| 1e-4 eV | 8e-7 | 2e-5 | 4e-4 | 1e-3 |
-| 1e-3 eV | 6e-4 | 4e-3 | 2e-1 | 6e-1 |
-| 4e-3 eV | 7e-5 | 5e-4 | 4e-1 | 7e-1 |
+`cnb_q_sampling = chi` fixes it. `transfer_cnb_q_sampling_chi()` places composite
+Gauss-Legendre panels in `q` so that the Bessel phase `k chi_nu(tau,q)` advances by
+`cnb_q_phase_step` per panel. The rate is evaluated at `k = min(l_max/chi_nu, k_max)`
+and maximised over all sampled times; late-time `chi_nu` of a non-relativistic
+neutrino goes like `q`, twice as steep in `ln q` as `chi_nu(tau_dec)`. It is scaled
+down where the effective weight `q * q^2 eps f0 * (1+M^2/q^2)` is below
+`cnb_q_weight_tol` of its maximum. Extra edges keep `dq <= 1`, `dlnq <= 0.5`.
 
-i.e. excellent for `m_nu <= 1e-4 eV` at all `l`, but **not converged** for
-`m_nu >= 1e-3 eV` above `l ~ 20`, and raising `cnb_q_size` helps only slowly. The
-cause is that for a massive neutrino `chi_nu(q)` varies steeply at small `q`, so
-`Delta_l(q)` oscillates rapidly in `q` and a Gauss-Laguerre rule tuned to the
-smooth weight `exp(-q)` resolves it poorly. Fixing this properly would mean
-replacing the momentum quadrature with one adapted to `chi_nu(q)` (for instance
-sampling uniformly in `chi_nu` rather than in `q`). Until then, heavy-mass,
-high-`l` results should be treated as indicative. `cnb_q_size` is capped at 80,
-beyond which the Gauss-Laguerre weights underflow.
+Checks made on 2026-10-16, `l_max = 200`, `k_max_tau0_over_l_max = 12`:
+
+- **Laguerre path unchanged:** bit-identical to the previous code, full and ISW-only.
+- **Self-convergence** (relative to `cnb_q_phase_step = 0.5`/`1`), worst case over `l <= 200`:
+
+  | `m_nu` | term | Laguerre 30 | Laguerre 80 | chi, step 8 | chi, step 4 |
+  |---|---|---|---|---|---|
+  | 1e-3 eV | SW  | 2.7 | 1.3 | 1.9e-3 | 3e-7 |
+  | 1e-3 eV | ISW | 0.71 | 0.26 | 6e-5 | 4e-7 |
+  | 4e-3 eV | SW  | 6.9 | 3.8 | 4.6e-3 | 2e-6 |
+  | 4e-3 eV | ISW | 2.1 | 0.94 | 1e-4 | 4e-7 |
+
+- **Independent reference for SW:** with `psi(tau_dec)` k-independent,
+  `C_l^SW = 4pi int dk/k P(k) [psi_dec <S(q) j_l(k chi_dec(q))>_W]^2`, computed in numpy on
+  4000-16000 `sqrt(q)` points with `chi_dec` from the CLASS background table (script kept
+  outside the repo). The chi-sampled CLASS SW spectrum agrees with it to `<= 0.33%` at
+  1e-3 eV and `<= 0.09%` at 4e-3 eV for all `l <= 200` (the same floor as at 1e-5 eV,
+  i.e. CLASS's own k/l sampling). Laguerre-30 is off by +29% / +275% (1e-3 eV, `l` = 50 / 200)
+  and +108% / +694% (4e-3 eV).
+- **Light masses:** chi agrees with Laguerre-80 to `< 5e-4` for 1e-4 eV and `< 1e-6` for 1e-5 eV.
+
+Cost: 180-200 momenta for a light species, ~1300 for 1e-3 or 4e-3 eV at step 4. Each
+ISW momentum costs ~0.06 s with 643 sampled times, so the four-mass run above takes
+222 s against 13 s for Laguerre-30. ISW alone is converged to 0.1% already at step 16,
+so separate SW/ISW momentum grids would cut that by about three.
 
 **Non-interference.** Enabling `cnbCl` changes the `TT` spectrum by at most
 `1e-4` in relative terms, through the extended source sampling of Sec. 2.3.
@@ -449,9 +478,12 @@ maximum at the same multipoles.
 **Still open: the momentum-approach ISW diverges as `q -> 0` for heavy masses**,
 since its source carries `eps^2/q^2 = 1/v^2`. This is what the equations say
 rather than a bug, and is presumably why Sec. 4.1 of the Thesis presents the
-energy approach as complementary, but it does make heavy-mass momentum-approach
-results sensitive to `cnb_q_size` (Sec. 5).
+energy approach as complementary. The integral converges, and the chi sampling
+of Sec. 5 resolves it; under the Laguerre sampling it makes heavy-mass results
+sensitive to `cnb_q_size`.
 
-**Still open: the momentum quadrature** is not converged for `m_nu >= 1e-3 eV`
-above `l ~ 20`. See Sec. 5; the fix is a rule adapted to `chi_nu(q)` rather than
-to `exp(-q)`.
+**Resolved: the momentum quadrature** for `m_nu >= 1e-3 eV`. The Gauss-Laguerre
+rule is not converged above `l ~ 20` for heavy masses, and `cnb_q_sampling = chi`
+(Sec. 5) is the fix: a rule adapted to `chi_nu(q)` rather than to `exp(-q)`.
+Laguerre stays the default because it is ~15x cheaper and exact enough for
+`m_nu <= 1e-4 eV`; use `chi` for anything heavier.
